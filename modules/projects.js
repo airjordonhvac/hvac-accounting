@@ -5,6 +5,21 @@ import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const MOD = 'projects';
+
+const COLUMNS = [
+  { key: 'project_number',  label: '#',         type: 'string' },
+  { key: 'name',            label: 'Name',      type: 'string' },
+  { key: 'customer_name',   label: 'Customer',  type: 'string', get: r => r._customer?.name || '' },
+  { key: 'status',          label: 'Status',    type: 'string' },
+  { key: 'contract_amount', label: 'Contract',  type: 'number', numeric: true },
+  { key: '_invoiced',       label: 'Invoiced',  type: 'number', numeric: true },
+  { key: '_cost',           label: 'Cost',      type: 'number', numeric: true },
+  { key: '_margin',         label: 'Margin',    type: 'number', numeric: true, get: r => r._invoiced - r._cost },
+  { key: '_actions',        label: '',          sortable: false },
+];
 
 export async function renderProjects(outlet) {
   outlet.innerHTML = `
@@ -31,9 +46,11 @@ export async function renderProjects(outlet) {
       <div class="empty-state"><div class="big">LOADING</div></div>
     </div>
   `;
+
   document.getElementById('new-proj').onclick = () => editProject(null, [], () => loadList());
   document.getElementById('proj-search').oninput = () => filterAndRender();
   document.getElementById('proj-status').onchange = () => filterAndRender();
+
   await loadList();
 }
 
@@ -100,15 +117,13 @@ function renderTable(rows) {
     wrap.innerHTML = `<div class="empty-state"><div class="big">NO PROJECTS</div><div>Click "New Project" to add one.</div></div>`;
     return;
   }
+  const state = getSortState(MOD, { key: 'project_number', dir: 'desc' });
+  const sorted = sortRows(rows, COLUMNS, state);
   wrap.innerHTML = `
     <table class="data">
-      <thead><tr>
-        <th>#</th><th>Name</th><th>Customer</th><th>Status</th>
-        <th class="numeric">Contract</th><th class="numeric">Invoiced</th>
-        <th class="numeric">Cost</th><th class="numeric">Margin</th><th></th>
-      </tr></thead>
+      <thead><tr>${headerHTML(COLUMNS, state)}</tr></thead>
       <tbody>
-        ${rows.map(p => {
+        ${sorted.map(p => {
           const margin = p._invoiced - p._cost;
           const marginPct = p._invoiced > 0 ? (margin / p._invoiced * 100) : 0;
           return `
@@ -133,6 +148,7 @@ function renderTable(rows) {
       editProject(p, window.__projCustomers || [], () => loadList());
     };
   });
+  attachSortHandlers(wrap, MOD, () => renderTable(rows));
 }
 
 function editProject(record, customers, onDone) {
