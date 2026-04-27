@@ -1,5 +1,5 @@
 // =============================================================================
-// Settings — Chart of Accounts editor + tax year locks + transaction categories + categorization rules
+// Settings — COA editor + tax year locks + transaction categories + rules
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { escapeHtml, fmtDate } from '../lib/format.js';
@@ -9,8 +9,8 @@ import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/s
 
 const COA_MOD = 'coa';
 const LOCKS_MOD = 'locks';
-const CAT_MOD = 'tx_cats';
-const RULES_MOD = 'tx_rules';
+const CAT_MOD = 'cats';
+const RULE_MOD = 'rules';
 
 const COA_COLUMNS = [
   { key: 'account_number', label: '#',       type: 'string' },
@@ -27,19 +27,20 @@ const LOCK_COLUMNS = [
 ];
 
 const CAT_COLUMNS = [
-  { key: 'name',          label: 'Name',     type: 'string' },
-  { key: 'display_order', label: 'Order',    type: 'number', numeric: true },
-  { key: 'is_active',     label: 'Active',   type: 'number', get: r => r.is_active ? 1 : 0 },
-  { key: '_actions',      label: '',         sortable: false },
+  { key: 'display_order', label: 'Order',  type: 'number' },
+  { key: 'name',          label: 'Name',   type: 'string' },
+  { key: 'color',         label: 'Color',  type: 'string', sortable: false },
+  { key: 'is_active',     label: 'Active', type: 'number', get: r => r.is_active ? 1 : 0 },
+  { key: '_actions',      label: '',       sortable: false },
 ];
 
 const RULE_COLUMNS = [
-  { key: 'match_text',  label: 'Match Text', type: 'string' },
-  { key: 'match_type',  label: 'Type',       type: 'string' },
-  { key: 'category',    label: 'Category',   type: 'string', get: r => r._category?.name || '' },
-  { key: 'priority',    label: 'Priority',   type: 'number', numeric: true },
-  { key: 'is_active',   label: 'Active',     type: 'number', get: r => r.is_active ? 1 : 0 },
-  { key: '_actions',    label: '',           sortable: false },
+  { key: 'priority',     label: 'Priority',   type: 'number' },
+  { key: 'match_type',   label: 'Match',      type: 'string' },
+  { key: 'match_text',   label: 'When desc.', type: 'string' },
+  { key: 'category',     label: 'Category',   type: 'string', get: r => r._cat?.name || '' },
+  { key: 'is_active',    label: 'Active',     type: 'number', get: r => r.is_active ? 1 : 0 },
+  { key: '_actions',     label: '',           sortable: false },
 ];
 
 export async function renderSettings(outlet) {
@@ -47,34 +48,38 @@ export async function renderSettings(outlet) {
     <div class="page-head">
       <div class="page-head-left">
         <h1>SETTINGS</h1>
-        <div class="page-head-sub">Chart of accounts, transaction categories, rules, tax year locks</div>
+        <div class="page-head-sub">Chart of accounts, categories, rules, tax year locks</div>
       </div>
     </div>
 
     <div class="card">
       <div class="card-header">
-        <div class="section-title">TRANSACTION CATEGORIES</div>
-        <div><button class="btn-sm btn-primary" id="new-cat">+ Category</button></div>
-      </div>
-      <div class="muted" style="font-size:12px;padding:0 14px 8px">Used to tag bank/credit transactions for end-of-year tax reporting. Mirrors how AmEx/Chase apps categorize spending.</div>
-      <div id="cat-table-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
-    </div>
-
-    <div class="card" style="margin-top:16px">
-      <div class="card-header">
-        <div class="section-title">CATEGORIZATION RULES</div>
-        <div><button class="btn-sm btn-primary" id="new-rule">+ Rule</button></div>
-      </div>
-      <div class="muted" style="font-size:12px;padding:0 14px 8px">When a transaction description matches the rule's text, it auto-assigns the chosen category. Lower priority numbers win on tie. Use the "Apply Rules to All" button on the Bank page to update existing transactions.</div>
-      <div id="rule-table-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
-    </div>
-
-    <div class="card" style="margin-top:16px">
-      <div class="card-header">
         <div class="section-title">CHART OF ACCOUNTS</div>
         <div><button class="btn-sm btn-primary" id="new-acct">+ Account</button></div>
       </div>
       <div id="coa-table-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-header">
+        <div>
+          <div class="section-title">TRANSACTION CATEGORIES</div>
+          <div class="muted" style="font-size:11px">Personal-style buckets for tagging bank/credit card transactions</div>
+        </div>
+        <div><button class="btn-sm btn-primary" id="new-cat">+ Category</button></div>
+      </div>
+      <div id="cats-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-header">
+        <div>
+          <div class="section-title">CATEGORIZATION RULES</div>
+          <div class="muted" style="font-size:11px">Auto-assign categories on statement import based on description keywords</div>
+        </div>
+        <div><button class="btn-sm btn-primary" id="new-rule">+ Rule</button></div>
+      </div>
+      <div id="rules-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
     </div>
 
     <div class="card" style="margin-top:16px">
@@ -85,220 +90,15 @@ export async function renderSettings(outlet) {
       <div id="locks-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
     </div>
   `;
-  document.getElementById('new-cat').onclick = () => editCategory(null, () => loadCategories());
-  document.getElementById('new-rule').onclick = () => editRule(null, () => loadRules());
   document.getElementById('new-acct').onclick = () => editAccount(null, () => loadCOA());
+  document.getElementById('new-cat').onclick = () => editCategory(null, () => loadCats());
+  document.getElementById('new-rule').onclick = () => editRule(null, () => loadRules());
   document.getElementById('new-lock').onclick = () => addLock(() => loadLocks());
-  await Promise.all([loadCategories(), loadRules(), loadCOA(), loadLocks()]);
+  await Promise.all([loadCOA(), loadCats(), loadRules(), loadLocks()]);
 }
 
 // =============================================================================
-// Categories
-// =============================================================================
-
-async function loadCategories() {
-  try {
-    const cats = await q(supabase.from('transaction_categories').select('*').order('display_order'));
-    window.__catsAll = cats;
-    if (!cats.length) {
-      document.getElementById('cat-table-wrap').innerHTML = `<div class="empty-state"><div class="muted">No categories yet.</div></div>`;
-      return;
-    }
-    renderCategories();
-  } catch (e) {
-    document.getElementById('cat-table-wrap').innerHTML =
-      `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
-  }
-}
-
-function renderCategories() {
-  const cats = window.__catsAll || [];
-  const wrap = document.getElementById('cat-table-wrap');
-  const state = getSortState(CAT_MOD, { key: 'display_order', dir: 'asc' });
-  const sorted = sortRows(cats, CAT_COLUMNS, state);
-  wrap.innerHTML = `
-    <table class="data">
-      <thead><tr>${headerHTML(CAT_COLUMNS, state)}</tr></thead>
-      <tbody>
-        ${sorted.map(c => `
-          <tr>
-            <td><span style="display:inline-block;width:14px;height:14px;border-radius:3px;background:${c.color || '#7B9DD6'};vertical-align:middle;margin-right:8px"></span><strong>${escapeHtml(c.name)}</strong></td>
-            <td class="numeric">${c.display_order}</td>
-            <td>${c.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
-            <td><button class="btn-sm btn-ghost edit-cat" data-id="${c.id}">Edit</button></td>
-          </tr>
-        `).join('')}
-      </tbody>
-    </table>
-  `;
-  wrap.querySelectorAll('.edit-cat').forEach(b => {
-    b.onclick = () => {
-      const c = (window.__catsAll || []).find(x => x.id === b.dataset.id);
-      editCategory(c, () => loadCategories());
-    };
-  });
-  attachSortHandlers(wrap, CAT_MOD, () => renderCategories());
-}
-
-function editCategory(record, onDone) {
-  const isNew = !record;
-  const r = record || { name: '', display_order: 999, color: '#7B9DD6', is_active: true };
-  modal({
-    title: isNew ? 'New Category' : 'Edit Category',
-    bodyHTML: `
-      <div class="field"><label class="field-label">Name *</label><input class="input" id="f-name" value="${escapeHtml(r.name || '')}"></div>
-      <div class="field-row">
-        <div class="field"><label class="field-label">Display Order</label><input class="input numeric" id="f-order" type="number" value="${r.display_order || 999}"></div>
-        <div class="field"><label class="field-label">Color</label><input class="input mono" id="f-color" type="color" value="${r.color || '#7B9DD6'}" style="height:36px"></div>
-      </div>
-      <div class="field" style="display:flex;gap:8px;align-items:center">
-        <input type="checkbox" id="f-active" ${r.is_active !== false ? 'checked' : ''}>
-        <label for="f-active" class="field-label" style="margin:0">Active</label>
-      </div>
-    `,
-    actions: [
-      ...(isNew ? [] : [{ label: 'Delete', kind: 'danger', onClick: async () => {
-        const ok = await confirmDialog('Delete category?', `Transactions tagged with "${r.name}" will become uncategorized. Confirm?`);
-        if (!ok) return false;
-        try { await q(supabase.from('transaction_categories').delete().eq('id', r.id)); toast('Deleted', { kind: 'success' }); onDone && onDone(); }
-        catch (e) { toast('Delete failed: ' + e.message, { kind: 'error' }); return false; }
-      } }]),
-      { label: 'Cancel', kind: 'secondary' },
-      { label: isNew ? 'Create' : 'Save', kind: 'primary', onClick: async (bg) => {
-        const data = {
-          name: bg.querySelector('#f-name').value.trim(),
-          display_order: Number(bg.querySelector('#f-order').value || 999),
-          color: bg.querySelector('#f-color').value,
-          is_active: bg.querySelector('#f-active').checked,
-        };
-        if (!data.name) { toast('Name is required', { kind: 'error' }); return false; }
-        try {
-          if (isNew) await q(supabase.from('transaction_categories').insert(data));
-          else await q(supabase.from('transaction_categories').update(data).eq('id', r.id));
-          toast('Saved', { kind: 'success' });
-          onDone && onDone();
-        } catch (e) { toast('Save failed: ' + e.message, { kind: 'error' }); return false; }
-      } },
-    ],
-  });
-}
-
-// =============================================================================
-// Rules
-// =============================================================================
-
-async function loadRules() {
-  try {
-    const [rules, cats] = await Promise.all([
-      q(supabase.from('categorization_rules').select('*').order('priority')),
-      q(supabase.from('transaction_categories').select('*').order('display_order')),
-    ]);
-    const catMap = new Map(cats.map(c => [c.id, c]));
-    window.__rulesAll = rules.map(r => ({ ...r, _category: catMap.get(r.category_id) }));
-    window.__rulesCats = cats;
-    if (!rules.length) {
-      document.getElementById('rule-table-wrap').innerHTML = `<div class="empty-state"><div class="muted">No rules yet. Click "+ Rule" to add one — or create rules straight from the Bank tab when you click an "Uncategorized" transaction.</div></div>`;
-      return;
-    }
-    renderRules();
-  } catch (e) {
-    document.getElementById('rule-table-wrap').innerHTML =
-      `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
-  }
-}
-
-function renderRules() {
-  const rules = window.__rulesAll || [];
-  const wrap = document.getElementById('rule-table-wrap');
-  const state = getSortState(RULES_MOD, { key: 'priority', dir: 'asc' });
-  const sorted = sortRows(rules, RULE_COLUMNS, state);
-  wrap.innerHTML = `
-    <table class="data">
-      <thead><tr>${headerHTML(RULE_COLUMNS, state)}</tr></thead>
-      <tbody>
-        ${sorted.map(r => `
-          <tr>
-            <td class="mono"><strong>${escapeHtml(r.match_text)}</strong></td>
-            <td><span class="pill pill-gray">${escapeHtml(r.match_type.toUpperCase())}</span></td>
-            <td>${r._category ? `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${r._category.color || '#7B9DD6'};vertical-align:middle;margin-right:6px"></span>${escapeHtml(r._category.name)}` : '<span class="muted">—</span>'}</td>
-            <td class="numeric">${r.priority}</td>
-            <td>${r.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
-            <td><button class="btn-sm btn-ghost edit-rule" data-id="${r.id}">Edit</button></td>
-          </tr>
-        `).join('')}
-      </tbody>
-    </table>
-  `;
-  wrap.querySelectorAll('.edit-rule').forEach(b => {
-    b.onclick = () => {
-      const r = (window.__rulesAll || []).find(x => x.id === b.dataset.id);
-      editRule(r, () => loadRules());
-    };
-  });
-  attachSortHandlers(wrap, RULES_MOD, () => renderRules());
-}
-
-function editRule(record, onDone) {
-  const isNew = !record;
-  const r = record || { match_text: '', match_type: 'contains', category_id: null, priority: 100, is_active: true };
-  const cats = window.__rulesCats || [];
-  modal({
-    title: isNew ? 'New Categorization Rule' : 'Edit Rule',
-    bodyHTML: `
-      <div class="field-row">
-        <div class="field"><label class="field-label">Match text *</label><input class="input" id="f-match" value="${escapeHtml(r.match_text || '')}" placeholder="e.g. Shell, Aramark, Adobe"></div>
-        <div class="field"><label class="field-label">Match type</label>
-          <select class="select" id="f-mtype">
-            ${['contains','starts_with','exact'].map(t => `<option value="${t}" ${t === r.match_type ? 'selected' : ''}>${t.toUpperCase().replace('_',' ')}</option>`).join('')}
-          </select>
-        </div>
-      </div>
-      <div class="field"><label class="field-label">Category *</label>
-        <select class="select" id="f-cat">
-          <option value="">— Select —</option>
-          ${cats.map(c => `<option value="${c.id}" ${c.id === r.category_id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
-        </select>
-      </div>
-      <div class="field-row">
-        <div class="field"><label class="field-label">Priority (lower wins)</label><input class="input numeric" id="f-priority" type="number" value="${r.priority || 100}"></div>
-        <div class="field" style="display:flex;gap:8px;align-items:center;align-self:end;padding-bottom:8px">
-          <input type="checkbox" id="f-active" ${r.is_active !== false ? 'checked' : ''}>
-          <label for="f-active" class="field-label" style="margin:0">Active</label>
-        </div>
-      </div>
-      <div class="muted" style="font-size:11px;margin-top:6px">Match is case-insensitive. New transactions are auto-categorized via this rule on insert. To apply to existing transactions, use the "Apply Rules to All" button on the Bank page.</div>
-    `,
-    actions: [
-      ...(isNew ? [] : [{ label: 'Delete', kind: 'danger', onClick: async () => {
-        const ok = await confirmDialog('Delete rule?', 'This will not un-categorize existing transactions.');
-        if (!ok) return false;
-        try { await q(supabase.from('categorization_rules').delete().eq('id', r.id)); toast('Deleted', { kind: 'success' }); onDone && onDone(); }
-        catch (e) { toast('Delete failed: ' + e.message, { kind: 'error' }); return false; }
-      } }]),
-      { label: 'Cancel', kind: 'secondary' },
-      { label: isNew ? 'Create' : 'Save', kind: 'primary', onClick: async (bg) => {
-        const data = {
-          match_text: bg.querySelector('#f-match').value.trim(),
-          match_type: bg.querySelector('#f-mtype').value,
-          category_id: bg.querySelector('#f-cat').value || null,
-          priority: Number(bg.querySelector('#f-priority').value || 100),
-          is_active: bg.querySelector('#f-active').checked,
-        };
-        if (!data.match_text) { toast('Match text required', { kind: 'error' }); return false; }
-        if (!data.category_id) { toast('Category required', { kind: 'error' }); return false; }
-        try {
-          if (isNew) await q(supabase.from('categorization_rules').insert(data));
-          else await q(supabase.from('categorization_rules').update(data).eq('id', r.id));
-          toast('Saved', { kind: 'success' });
-          onDone && onDone();
-        } catch (e) { toast('Save failed: ' + e.message, { kind: 'error' }); return false; }
-      } },
-    ],
-  });
-}
-
-// =============================================================================
-// Chart of Accounts (kept identical to prior version)
+// Chart of accounts
 // =============================================================================
 
 async function loadCOA() {
@@ -307,7 +107,7 @@ async function loadCOA() {
     window.__coaAll = accounts;
     if (!accounts.length) {
       document.getElementById('coa-table-wrap').innerHTML =
-        `<div class="empty-state"><div class="big">NO ACCOUNTS</div><div>Run the COA seed migration to populate.</div></div>`;
+        `<div class="empty-state"><div class="big">NO ACCOUNTS</div></div>`;
       return;
     }
     renderCOA();
@@ -389,7 +189,226 @@ function editAccount(record, onDone) {
 }
 
 // =============================================================================
-// Tax Year Locks
+// Transaction categories
+// =============================================================================
+
+async function loadCats() {
+  try {
+    const [cats, coa] = await Promise.all([
+      q(supabase.from('transaction_categories').select('*').order('display_order')),
+      q(supabase.from('chart_of_accounts').select('id, account_number, name').eq('is_active', true).in('type', ['cogs','expense']).order('account_number')),
+    ]);
+    window.__catsAll = cats;
+    window.__coaForCats = coa;
+    if (!cats.length) {
+      document.getElementById('cats-wrap').innerHTML = `<div class="empty-state"><div class="muted">No categories yet. Run migration 005 or click "+ Category".</div></div>`;
+      return;
+    }
+    renderCats();
+  } catch (e) {
+    document.getElementById('cats-wrap').innerHTML =
+      `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
+  }
+}
+
+function renderCats() {
+  const cats = window.__catsAll || [];
+  const wrap = document.getElementById('cats-wrap');
+  const state = getSortState(CAT_MOD, { key: 'display_order', dir: 'asc' });
+  const sorted = sortRows(cats, CAT_COLUMNS, state);
+  wrap.innerHTML = `
+    <table class="data">
+      <thead><tr>${headerHTML(CAT_COLUMNS, state)}</tr></thead>
+      <tbody>
+        ${sorted.map(c => `
+          <tr>
+            <td class="mono">${c.display_order}</td>
+            <td><strong>${escapeHtml(c.name)}</strong></td>
+            <td><span style="display:inline-block;width:18px;height:18px;border-radius:3px;background:${c.color || '#888'};vertical-align:middle;margin-right:6px"></span><span class="mono" style="font-size:11px">${c.color || '—'}</span></td>
+            <td>${c.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
+            <td><button class="btn-sm btn-ghost edit-cat" data-id="${c.id}">Edit</button></td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  wrap.querySelectorAll('.edit-cat').forEach(b => {
+    b.onclick = () => {
+      const c = (window.__catsAll || []).find(x => x.id === b.dataset.id);
+      editCategory(c, () => loadCats());
+    };
+  });
+  attachSortHandlers(wrap, CAT_MOD, () => renderCats());
+}
+
+function editCategory(record, onDone) {
+  const isNew = !record;
+  const r = record || { name: '', display_order: 100, color: '#7B9DD6', coa_account_id: null, is_active: true };
+  const coa = window.__coaForCats || [];
+  const coaOpts = '<option value="">— None —</option>' + coa.map(a =>
+    `<option value="${a.id}" ${a.id === r.coa_account_id ? 'selected' : ''}>${escapeHtml(a.account_number)} — ${escapeHtml(a.name)}</option>`
+  ).join('');
+  modal({
+    title: isNew ? 'New Category' : 'Edit Category',
+    bodyHTML: `
+      <div class="field"><label class="field-label">Name *</label><input class="input" id="f-name" value="${escapeHtml(r.name || '')}" placeholder="e.g. Travel, Software, Vehicle Fuel"></div>
+      <div class="field-row">
+        <div class="field"><label class="field-label">Display Order</label><input class="input numeric" id="f-order" type="number" value="${r.display_order}"></div>
+        <div class="field"><label class="field-label">Color</label><input class="input" id="f-color" type="color" value="${r.color || '#7B9DD6'}" style="height:38px;padding:2px"></div>
+      </div>
+      <div class="field"><label class="field-label">Map to COA Account (optional, used at tax export)</label>
+        <select class="select" id="f-coa">${coaOpts}</select>
+      </div>
+      <div class="field" style="display:flex;gap:8px;align-items:center">
+        <input type="checkbox" id="f-active" ${r.is_active !== false ? 'checked' : ''}>
+        <label for="f-active" class="field-label" style="margin:0">Active</label>
+      </div>
+    `,
+    actions: [
+      ...(isNew ? [] : [{ label: 'Delete', kind: 'danger', onClick: async () => {
+        const ok = await confirmDialog('Delete category?', 'Transactions tagged with this category will become uncategorized. Confirm?');
+        if (!ok) return false;
+        try { await q(supabase.from('transaction_categories').delete().eq('id', r.id)); toast('Deleted', { kind: 'success' }); onDone && onDone(); }
+        catch (e) { toast('Failed: ' + e.message, { kind: 'error' }); return false; }
+      } }]),
+      { label: 'Cancel', kind: 'secondary' },
+      { label: isNew ? 'Create' : 'Save', kind: 'primary', onClick: async (bg) => {
+        const data = {
+          name: bg.querySelector('#f-name').value.trim(),
+          display_order: Number(bg.querySelector('#f-order').value) || 100,
+          color: bg.querySelector('#f-color').value || '#7B9DD6',
+          coa_account_id: bg.querySelector('#f-coa').value || null,
+          is_active: bg.querySelector('#f-active').checked,
+        };
+        if (!data.name) { toast('Name is required', { kind: 'error' }); return false; }
+        try {
+          if (isNew) await q(supabase.from('transaction_categories').insert(data));
+          else await q(supabase.from('transaction_categories').update(data).eq('id', r.id));
+          toast('Saved', { kind: 'success' });
+          onDone && onDone();
+        } catch (e) { toast('Save failed: ' + e.message, { kind: 'error' }); return false; }
+      } },
+    ],
+  });
+}
+
+// =============================================================================
+// Categorization rules
+// =============================================================================
+
+async function loadRules() {
+  try {
+    const [rules, cats] = await Promise.all([
+      q(supabase.from('categorization_rules').select('*').order('priority')),
+      q(supabase.from('transaction_categories').select('*').eq('is_active', true).order('display_order')),
+    ]);
+    const catMap = new Map(cats.map(c => [c.id, c]));
+    window.__rulesAll = rules.map(r => ({ ...r, _cat: catMap.get(r.category_id) }));
+    window.__catsForRules = cats;
+    if (!rules.length) {
+      document.getElementById('rules-wrap').innerHTML = `<div class="empty-state"><div class="muted">No rules yet. Click "+ Rule" to add keyword auto-categorization.</div></div>`;
+      return;
+    }
+    renderRules();
+  } catch (e) {
+    document.getElementById('rules-wrap').innerHTML =
+      `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
+  }
+}
+
+function renderRules() {
+  const rules = window.__rulesAll || [];
+  const wrap = document.getElementById('rules-wrap');
+  const state = getSortState(RULE_MOD, { key: 'priority', dir: 'asc' });
+  const sorted = sortRows(rules, RULE_COLUMNS, state);
+  wrap.innerHTML = `
+    <table class="data">
+      <thead><tr>${headerHTML(RULE_COLUMNS, state)}</tr></thead>
+      <tbody>
+        ${sorted.map(r => `
+          <tr>
+            <td class="mono">${r.priority}</td>
+            <td><span class="pill pill-gray">${(r.match_type || 'contains').toUpperCase()}</span></td>
+            <td class="mono" style="font-size:12px">"${escapeHtml(r.match_text)}"</td>
+            <td>${r._cat ? `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${r._cat.color};margin-right:6px"></span>${escapeHtml(r._cat.name)}` : '<span class="muted">—</span>'}</td>
+            <td>${r.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
+            <td><button class="btn-sm btn-ghost edit-rule" data-id="${r.id}">Edit</button></td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  wrap.querySelectorAll('.edit-rule').forEach(b => {
+    b.onclick = () => {
+      const r = (window.__rulesAll || []).find(x => x.id === b.dataset.id);
+      editRule(r, () => loadRules());
+    };
+  });
+  attachSortHandlers(wrap, RULE_MOD, () => renderRules());
+}
+
+function editRule(record, onDone) {
+  const isNew = !record;
+  const r = record || { match_text: '', match_type: 'contains', priority: 100, category_id: null, is_active: true };
+  const cats = window.__catsForRules || [];
+  const catOpts = '<option value="">— Select category —</option>' + cats.map(c =>
+    `<option value="${c.id}" ${c.id === r.category_id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
+  ).join('');
+  modal({
+    title: isNew ? 'New Rule' : 'Edit Rule',
+    bodyHTML: `
+      <div class="muted" style="margin-bottom:10px">When a bank/credit transaction's description matches the keyword below, it auto-tags with the chosen category.</div>
+      <div class="field-row">
+        <div class="field"><label class="field-label">Match Type</label>
+          <select class="select" id="f-mtype">
+            ${['contains','starts_with','exact'].map(t => `<option value="${t}" ${t === r.match_type ? 'selected' : ''}>${t.replace('_',' ').toUpperCase()}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label class="field-label">Priority (lower wins)</label><input class="input numeric" id="f-prio" type="number" value="${r.priority}"></div>
+      </div>
+      <div class="field"><label class="field-label">When description ${(r.match_type || 'contains').replace('_',' ')} *</label>
+        <input class="input mono" id="f-text" value="${escapeHtml(r.match_text || '')}" placeholder='e.g. "Shell" or "AMEX Epayment"'>
+      </div>
+      <div class="field"><label class="field-label">Then assign category *</label>
+        <select class="select" id="f-cat">${catOpts}</select>
+      </div>
+      <div class="field" style="display:flex;gap:8px;align-items:center">
+        <input type="checkbox" id="f-active" ${r.is_active !== false ? 'checked' : ''}>
+        <label for="f-active" class="field-label" style="margin:0">Active</label>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:6px">Tip: keyword match is case-insensitive. Use "AMEX Epayment" to catch all your American Express auto-pays.</div>
+    `,
+    actions: [
+      ...(isNew ? [] : [{ label: 'Delete', kind: 'danger', onClick: async () => {
+        const ok = await confirmDialog('Delete rule?', 'Future transactions matching this rule will no longer auto-categorize.');
+        if (!ok) return false;
+        try { await q(supabase.from('categorization_rules').delete().eq('id', r.id)); toast('Deleted', { kind: 'success' }); onDone && onDone(); }
+        catch (e) { toast('Failed: ' + e.message, { kind: 'error' }); return false; }
+      } }]),
+      { label: 'Cancel', kind: 'secondary' },
+      { label: isNew ? 'Create' : 'Save', kind: 'primary', onClick: async (bg) => {
+        const data = {
+          match_text: bg.querySelector('#f-text').value.trim(),
+          match_type: bg.querySelector('#f-mtype').value,
+          priority: Number(bg.querySelector('#f-prio').value) || 100,
+          category_id: bg.querySelector('#f-cat').value || null,
+          is_active: bg.querySelector('#f-active').checked,
+        };
+        if (!data.match_text) { toast('Match text is required', { kind: 'error' }); return false; }
+        if (!data.category_id) { toast('Pick a category', { kind: 'error' }); return false; }
+        try {
+          if (isNew) await q(supabase.from('categorization_rules').insert(data));
+          else await q(supabase.from('categorization_rules').update(data).eq('id', r.id));
+          toast('Saved', { kind: 'success' });
+          onDone && onDone();
+        } catch (e) { toast('Save failed: ' + e.message, { kind: 'error' }); return false; }
+      } },
+    ],
+  });
+}
+
+// =============================================================================
+// Tax year locks
 // =============================================================================
 
 async function loadLocks() {
