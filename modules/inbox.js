@@ -1,22 +1,12 @@
 // =============================================================================
 // Inbox — document upload + pending approval queue
 // -----------------------------------------------------------------------------
-// Four states per doc:
-//   uploaded  → file saved, extraction not yet triggered (rare; we auto-trigger)
-//   extracting → edge function running Claude API
-//   pending    → extraction done, awaiting admin approval
-//   approved/rejected → terminal
-//
-// UI:
-//   - Upload zone (drag, click, paste) with doc-type selector
-//   - Queue tabs: Pending (N) / Processing / Resolved
-//   - Side-by-side review: PDF preview ⟷ editable form, Approve/Reject buttons
+// Five doc types: bill (AP), invoice (AR), contract, bank_statement, w9
 // =============================================================================
-
 import { supabase } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
-import { confirmDialog } from '../lib/modal.js';
+import { confirmDialog, modal } from '../lib/modal.js';
 import { isAdmin, getCurrentUser } from '../lib/auth.js';
 import { materialize } from './materialize.js';
 
@@ -27,7 +17,7 @@ export async function renderInbox(outlet) {
     <div class="page-head">
       <div class="page-head-left">
         <h1>INBOX</h1>
-        <div class="page-head-sub">Drop vendor bills, contracts, bank statements, or W-9s to auto-file</div>
+        <div class="page-head-sub">Drop bills, customer invoices, contracts, statements, or W-9s to auto-file</div>
       </div>
     </div>
 
@@ -41,17 +31,16 @@ export async function renderInbox(outlet) {
         </svg>
         <div class="upload-head">Drop files here or click to browse</div>
         <div class="upload-sub">PDF, JPG, PNG · up to 10MB per file · paste from clipboard also works</div>
-
         <div class="upload-type-row">
           <label class="field-label" style="margin-bottom: 4px">Document type</label>
           <select id="upload-type">
-            <option value="bill">Vendor Bill / Receipt</option>
+            <option value="bill">Vendor Bill / Receipt (AP)</option>
+            <option value="invoice">Customer Invoice (AR)</option>
             <option value="contract">Customer PO / Contract</option>
             <option value="bank_statement">Bank / Credit Card Statement</option>
             <option value="w9">W-9 Form</option>
           </select>
         </div>
-
         <input type="file" id="upload-input" multiple accept="application/pdf,image/jpeg,image/png" style="display:none">
       </div>
     </div>
@@ -72,44 +61,33 @@ export async function renderInbox(outlet) {
   await loadQueue('pending');
 }
 
-// -----------------------------------------------------------------------------
-// Upload handling
-// -----------------------------------------------------------------------------
 function wireUploadZone() {
   const zone = document.getElementById('upload-zone');
   const input = document.getElementById('upload-input');
   const typeSelect = document.getElementById('upload-type');
-
   const trigger = () => input.click();
   zone.onclick = (e) => {
-    // Don't re-open file picker when user clicks the type selector
     if (e.target.closest('.upload-type-row')) return;
     trigger();
   };
-
   input.onchange = async () => {
     const files = Array.from(input.files || []);
-    for (const file of files) {
-      await uploadFile(file, typeSelect.value);
-    }
+    for (const file of files) await uploadFile(file, typeSelect.value);
     input.value = '';
     await loadQueue('pending');
   };
-
-  // Drag and drop
-  ['dragenter', 'dragover'].forEach(ev =>
-    zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.add('dragover'); }));
-  ['dragleave', 'drop'].forEach(ev =>
-    zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.remove('dragover'); }));
+  ['dragenter', 'dragover'].forEach(ev => zone.addEventListener(ev, (e) => {
+    e.preventDefault(); zone.classList.add('dragover');
+  }));
+  ['dragleave', 'drop'].forEach(ev => zone.addEventListener(ev, (e) => {
+    e.preventDefault(); zone.classList.remove('dragover');
+  }));
   zone.addEventListener('drop', async (e) => {
     const files = Array.from(e.dataTransfer.files || []);
     for (const file of files) await uploadFile(file, typeSelect.value);
     await loadQueue('pending');
   });
-
-  // Paste from clipboard
   document.addEventListener('paste', async (e) => {
-    // Only handle paste when inbox page is active
     if (!document.getElementById('upload-zone')) return;
     const items = Array.from(e.clipboardData?.items || []);
     const files = items.filter(i => i.kind === 'file').map(i => i.getAsFile());
@@ -122,28 +100,17 @@ function wireUploadZone() {
 async function uploadFile(file, docType) {
   const user = getCurrentUser();
   if (!user) { toast('Not signed in', { kind: 'error' }); return; }
-
-  // Validate
   const maxBytes = 10 * 1024 * 1024;
   if (file.size > maxBytes) {
     toast(`${file.name} too large (${(file.size / 1024 / 1024).toFixed(1)}MB, max 10MB)`, { kind: 'error' });
     return;
   }
-
   toast(`Uploading ${file.name}...`);
-
-  // 1. Upload to Supabase Storage
   const storageKey = `${user.id}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
   const { error: upErr } = await supabase.storage.from(STORAGE_BUCKET).upload(storageKey, file, {
-    contentType: file.type,
-    upsert: false,
+    contentType: file.type, upsert: false,
   });
-  if (upErr) {
-    toast(`Upload failed: ${upErr.message}`, { kind: 'error' });
-    return;
-  }
-
-  // 2. Create documents row
+  if (upErr) { toast(`Upload failed: ${upErr.message}`, { kind: 'error' }); return; }
   const { data: docRow, error: docErr } = await supabase.from('documents').insert({
     doc_type: docType,
     storage_path: `${STORAGE_BUCKET}/${storageKey}`,
@@ -153,24 +120,14 @@ async function uploadFile(file, docType) {
     status: 'uploaded',
     uploaded_by: user.id,
   }).select().single();
-  if (docErr) {
-    toast(`DB insert failed: ${docErr.message}`, { kind: 'error' });
-    return;
-  }
-
-  // 3. Kick off extraction via edge function (async — don't await the result
-  //    completion, just the invoke. The UI will poll or the user reloads.)
+  if (docErr) { toast(`DB insert failed: ${docErr.message}`, { kind: 'error' }); return; }
   supabase.functions.invoke('extract', { body: { document_id: docRow.id } })
     .then(({ error }) => {
       if (error) toast(`Extraction failed for ${file.name}: ${error.message}`, { kind: 'error' });
     });
-
   toast(`${file.name} uploaded — extracting...`, { kind: 'success' });
 }
 
-// -----------------------------------------------------------------------------
-// Queue tabs
-// -----------------------------------------------------------------------------
 function wireTabs() {
   document.querySelectorAll('#inbox-tabs .inbox-tab').forEach(btn => {
     btn.onclick = () => {
@@ -185,40 +142,32 @@ async function loadQueue(tab) {
   const list = document.getElementById('inbox-list');
   if (!list) return;
   list.innerHTML = '<div class="empty-state"><div class="big">LOADING</div></div>';
-
   let statusFilter;
   if (tab === 'pending') statusFilter = ['pending'];
   else if (tab === 'extracting') statusFilter = ['uploaded', 'extracting', 'failed'];
   else statusFilter = ['approved', 'rejected'];
-
   const { data: docs, error } = await supabase
     .from('documents')
-    .select('id, doc_type, original_filename, status, uploaded_at, processed_at, extraction_error, storage_path')
+    .select('id, doc_type, original_filename, status, uploaded_at, processed_at, extraction_error, storage_path, mime_type')
     .in('status', statusFilter)
     .order('uploaded_at', { ascending: false })
     .limit(50);
-
   if (error) {
     list.innerHTML = `<div class="empty-state"><div class="big">ERROR</div><div>${error.message}</div></div>`;
     return;
   }
-
-  // Update tab counts
   await refreshTabCounts();
-
   if (!docs?.length) {
     list.innerHTML = `<div class="empty-state"><div class="big">EMPTY</div><div>No documents in this tab.</div></div>`;
     return;
   }
-
   if (tab === 'pending') {
-    // Pending: show side-by-side review cards
     const cardsHtml = await Promise.all(docs.map(d => renderPendingCard(d)));
     list.innerHTML = cardsHtml.join('');
     wirePendingActions();
   } else {
-    // Processing / Resolved: show compact list
     list.innerHTML = renderCompactList(docs);
+    wireCompactActions(tab);
   }
 }
 
@@ -231,41 +180,32 @@ async function refreshTabCounts() {
   document.getElementById('count-extracting').textContent = processingCount ?? '—';
 }
 
-// -----------------------------------------------------------------------------
-// Pending review card — the heart of the UX
-// -----------------------------------------------------------------------------
 async function renderPendingCard(doc) {
-  // Fetch the pending entry
   const { data: entries } = await supabase.from('pending_entries')
     .select('*').eq('document_id', doc.id).eq('status', 'pending').limit(1);
   const entry = entries?.[0];
-  if (!entry) return '';  // race condition / mismatch
-
-  // Get signed URL for preview
+  if (!entry) return '';
   const [bucket, ...keyParts] = doc.storage_path.split('/');
   const { data: signed } = await supabase.storage.from(bucket)
-    .createSignedUrl(keyParts.join('/'), 300);  // 5 min
+    .createSignedUrl(keyParts.join('/'), 300);
   const previewUrl = signed?.signedUrl || '';
-
   const confidence = Number(entry.confidence ?? 0);
   const confClass = confidence >= 0.85 ? 'high' : confidence >= 0.65 ? 'med' : 'low';
-
   return `
-    <div class="review-card" data-doc-id="${doc.id}" data-entry-id="${entry.id}">
+    <div class="review-card" data-doc-id="${doc.id}" data-entry-id="${entry.id}" data-doc-type="${doc.doc_type}">
       <div class="review-head">
         <div>
           <strong>${escapeHtml(doc.original_filename)}</strong>
-          <span class="pill pill-${doc.doc_type === 'bill' ? 'open' : 'active'}">${doc.doc_type.replace('_',' ')}</span>
+          <span class="pill pill-${doc.doc_type === 'bill' ? 'open' : (doc.doc_type === 'invoice' ? 'paid' : 'active')}">${docTypeLabel(doc.doc_type)}</span>
           <span class="confidence confidence-${confClass}">${(confidence * 100).toFixed(0)}% confidence</span>
         </div>
         <div class="review-meta">Uploaded ${fmtDate(doc.uploaded_at)}</div>
       </div>
       <div class="review-body">
         <div class="review-preview">
-          ${previewUrl
-            ? (doc.mime_type?.startsWith('image/')
-                ? `<img src="${previewUrl}" alt="Document preview">`
-                : `<iframe src="${previewUrl}" title="Document preview"></iframe>`)
+          ${previewUrl ? (doc.mime_type?.startsWith('image/')
+            ? `<img src="${previewUrl}" alt="Document preview">`
+            : `<iframe src="${previewUrl}" title="Document preview"></iframe>`)
             : '<div class="muted">Preview unavailable</div>'}
         </div>
         <div class="review-form">
@@ -281,15 +221,24 @@ async function renderPendingCard(doc) {
     </div>`;
 }
 
+function docTypeLabel(t) {
+  return ({
+    bill: 'BILL (AP)',
+    invoice: 'INVOICE (AR)',
+    contract: 'CONTRACT',
+    bank_statement: 'BANK STATEMENT',
+    w9: 'W-9',
+  }[t] || t.replace('_', ' ').toUpperCase());
+}
+
 function renderReviewForm(docType, entry) {
   const raw = entry.raw_extraction || {};
   if (docType === 'bill') {
-    const lines = (raw.lines || []).map(l =>
-      `<div class="line-row">
-        <span class="line-desc">${escapeHtml(l.description || '')}</span>
-        <span class="mono">${Number(l.quantity || 1)} × ${fmtMoney(l.rate || 0)}</span>
-        <span class="mono num">${fmtMoney(l.amount || 0)}</span>
-      </div>`).join('');
+    const lines = (raw.lines || []).map(l => `<div class="line-row">
+      <span class="line-desc">${escapeHtml(l.description || '')}</span>
+      <span class="mono">${Number(l.quantity || 1)} × ${fmtMoney(l.rate || 0)}</span>
+      <span class="mono num">${fmtMoney(l.amount || 0)}</span>
+    </div>`).join('');
     return `
       <div class="kv-grid">
         <div class="kv"><span>Vendor</span><strong>${escapeHtml(raw.vendor_name || '—')}</strong></div>
@@ -297,6 +246,47 @@ function renderReviewForm(docType, entry) {
         <div class="kv"><span>Date</span><strong>${escapeHtml(raw.bill_date || '—')}</strong></div>
         <div class="kv"><span>Due</span><strong>${escapeHtml(raw.due_date || '—')}</strong></div>
         <div class="kv"><span>Project hint</span><strong>${escapeHtml(raw.project_hint || '—')}</strong></div>
+      </div>
+      ${lines ? `<div class="line-items">${lines}</div>` : ''}
+      <div class="total-row">
+        <span>Subtotal <strong class="mono">${fmtMoney(raw.subtotal || 0)}</strong></span>
+        <span>Tax <strong class="mono">${fmtMoney(raw.tax || 0)}</strong></span>
+        <span class="total-big">Total <strong class="mono">${fmtMoney(raw.total || 0)}</strong></span>
+      </div>
+    `;
+  }
+  if (docType === 'invoice') {
+    // CUSTOMER INVOICE (AR). The auto-extractor may have misread the customer
+    // because invoices have your letterhead on top. We surface ALL extracted
+    // values as editable fields so the user can correct before approval.
+    const lines = (raw.lines || []).map(l => `<div class="line-row">
+      <span class="line-desc">${escapeHtml(l.description || '')}</span>
+      <span class="mono">${Number(l.quantity || 1)} × ${fmtMoney(l.rate || 0)}</span>
+      <span class="mono num">${fmtMoney(l.amount || 0)}</span>
+    </div>`).join('');
+    // Best-guess customer: prefer extractor's customer_name / bill_to, else nothing.
+    const customerGuess = raw.customer_name || raw.bill_to_name || '';
+    return `
+      <div class="ar-edit-banner">Review customer details below. The extractor uses your letterhead by default — verify the customer name is correct.</div>
+      <div class="kv-grid">
+        <div class="kv ar-edit">
+          <span>Customer *</span>
+          <input class="ar-input" data-edit="edited_customer_name" value="${escapeHtml(customerGuess)}" placeholder="e.g. JMSMITT Construction">
+        </div>
+        <div class="kv ar-edit">
+          <span>Invoice #</span>
+          <input class="ar-input" data-edit="invoice_number" value="${escapeHtml(raw.invoice_number || raw.bill_number || '')}">
+        </div>
+        <div class="kv ar-edit">
+          <span>Issue Date</span>
+          <input class="ar-input" data-edit="issue_date" type="date" value="${escapeHtml(raw.issue_date || raw.bill_date || raw.invoice_date || '')}">
+        </div>
+        <div class="kv ar-edit">
+          <span>Due Date</span>
+          <input class="ar-input" data-edit="due_date" type="date" value="${escapeHtml(raw.due_date || '')}">
+        </div>
+        <div class="kv"><span>Project hint</span><strong>${escapeHtml(raw.project_hint || '—')}</strong></div>
+        <div class="kv"><span>Total (extracted)</span><strong class="mono">${fmtMoney(raw.total || 0)}</strong></div>
       </div>
       ${lines ? `<div class="line-items">${lines}</div>` : ''}
       <div class="total-row">
@@ -321,12 +311,11 @@ function renderReviewForm(docType, entry) {
   }
   if (docType === 'bank_statement') {
     const txns = (raw.transactions || []).slice(0, 10);
-    const txnRows = txns.map(t =>
-      `<div class="line-row">
-        <span class="mono muted">${escapeHtml(t.date || '')}</span>
-        <span class="line-desc">${escapeHtml(t.description || '')}</span>
-        <span class="mono num ${Number(t.amount) < 0 ? 'delta-down' : 'delta-up'}">${fmtMoney(t.amount || 0)}</span>
-      </div>`).join('');
+    const txnRows = txns.map(t => `<div class="line-row">
+      <span class="mono muted">${escapeHtml(t.date || '')}</span>
+      <span class="line-desc">${escapeHtml(t.description || '')}</span>
+      <span class="mono num ${Number(t.amount) < 0 ? 'delta-down' : 'delta-up'}">${fmtMoney(t.amount || 0)}</span>
+    </div>`).join('');
     return `
       <div class="kv-grid">
         <div class="kv"><span>Account</span><strong>···${escapeHtml(raw.account_last4 || '—')}</strong></div>
@@ -357,21 +346,17 @@ function wirePendingActions() {
   document.querySelectorAll('.review-card').forEach(card => {
     const docId = card.dataset.docId;
     const entryId = card.dataset.entryId;
-    card.querySelector('[data-action="approve"]').onclick = () => approveEntry(docId, entryId);
+    const docType = card.dataset.docType;
+    card.querySelector('[data-action="approve"]').onclick = () => approveEntry(docId, entryId, card, docType);
     card.querySelector('[data-action="reject"]').onclick = () => rejectEntry(docId, entryId);
     card.querySelector('[data-action="edit"]').onclick = () => {
-      toast('Edit mode coming next build — for now approve/reject only', { kind: 'info' });
+      toast('Inline edits supported — change the fields directly and click Approve & Save', { kind: 'info' });
     };
   });
 }
 
-async function approveEntry(docId, entryId) {
-  if (!isAdmin()) {
-    toast('Only admins can approve entries', { kind: 'error' });
-    return;
-  }
-
-  // Fetch full entry + document so materialize() has what it needs.
+async function approveEntry(docId, entryId, card, docType) {
+  if (!isAdmin()) { toast('Only admins can approve entries', { kind: 'error' }); return; }
   const { data: entry, error: e1 } = await supabase.from('pending_entries')
     .select('*').eq('id', entryId).single();
   if (e1) { toast('Could not load entry: ' + e1.message, { kind: 'error' }); return; }
@@ -379,69 +364,78 @@ async function approveEntry(docId, entryId) {
     .select('*').eq('id', docId).single();
   if (e2) { toast('Could not load document: ' + e2.message, { kind: 'error' }); return; }
 
-  // Build confirmation message that surfaces what's about to be created — this
-  // is where we tell the user "creates new vendor: X" if the matched_vendor_id
-  // is null.
+  // For doc_type='invoice' (AR), apply user-edited overrides from the card.
+  // We map doc_type to entry_type here in case the extractor stored the legacy 'bill' entry_type.
+  if (docType === 'invoice') {
+    entry.entry_type = 'invoice';
+    const edits = {};
+    card.querySelectorAll('[data-edit]').forEach(input => {
+      const key = input.dataset.edit;
+      const val = (input.value || '').trim();
+      if (val) edits[key] = val;
+    });
+    entry.raw_extraction = { ...(entry.raw_extraction || {}), ...edits };
+    if (!edits.edited_customer_name) {
+      toast('Customer name is required for AR invoices', { kind: 'error' });
+      return;
+    }
+    // Persist the edits and entry_type back to pending_entries so the
+    // recovery healOrphans path also picks them up.
+    await supabase.from('pending_entries').update({
+      entry_type: 'invoice',
+      raw_extraction: entry.raw_extraction,
+    }).eq('id', entry.id);
+  }
+
   const willCreateNew = buildCreationPreview(entry);
   const ok = await confirmDialog(
     'Approve and save?',
-    willCreateNew
-      ? `Create record from this document. ${willCreateNew}`
-      : 'Create record from this document and mark approved.',
+    willCreateNew ? `Create record from this document. ${willCreateNew}` : 'Create record from this document and mark approved.',
     { okLabel: 'Approve', danger: false }
   );
   if (!ok) return;
 
-  // Materialize. This creates the real record and flips pending status.
   const result = await materialize(entry, doc);
   if (!result.ok) {
     toast('Approval failed: ' + result.error, { kind: 'error', ms: 6000 });
     return;
   }
-
   const labelMap = {
-    bills: 'Bill created',
+    bills: 'Bill created (AP)',
+    invoices: 'Invoice created (AR)',
     projects: 'Project created',
     import_batches: 'Statement imported',
     vendors: 'Vendor updated',
   };
   toast(labelMap[result.table] || 'Record created', { kind: 'success' });
-
   if (result.note) toast(result.note, { kind: 'info', ms: 4500 });
-
   await loadQueue('pending');
 }
 
-/** Tells the user what *new* records (if any) approval will create. */
 function buildCreationPreview(entry) {
   const raw = entry.raw_extraction || {};
   const parts = [];
   if (entry.entry_type === 'bill') {
-    if (!entry.matched_vendor_id && raw.vendor_name) {
-      parts.push(`Will create new vendor: ${raw.vendor_name}.`);
-    }
-    if (raw.lines?.length) {
-      parts.push(`${raw.lines.length} line item${raw.lines.length === 1 ? '' : 's'}.`);
-    }
+    if (!entry.matched_vendor_id && raw.vendor_name) parts.push(`Will create new vendor: ${raw.vendor_name}.`);
+    if (raw.lines?.length) parts.push(`${raw.lines.length} line item${raw.lines.length === 1 ? '' : 's'}.`);
+  } else if (entry.entry_type === 'invoice') {
+    const c = raw.edited_customer_name || raw.customer_name;
+    if (c && !entry.matched_customer_id) parts.push(`Will create new customer: ${c}.`);
+    parts.push('Invoice will be added to Accounts Receivable as Sent status.');
   } else if (entry.entry_type === 'project') {
-    if (!entry.matched_customer_id && raw.customer_name) {
-      parts.push(`Will create new customer: ${raw.customer_name}.`);
-    }
+    if (!entry.matched_customer_id && raw.customer_name) parts.push(`Will create new customer: ${raw.customer_name}.`);
   } else if (entry.entry_type === 'bank_transactions') {
     parts.push(`${raw.transactions?.length || 0} transactions to import.`);
   } else if (entry.entry_type === 'vendor_update') {
-    if (!entry.matched_vendor_id) {
-      parts.push(`Will create new vendor from W-9: ${raw.legal_name || raw.business_name}.`);
-    } else {
-      parts.push('Will update existing vendor with W-9 details and mark as 1099.');
-    }
+    if (!entry.matched_vendor_id) parts.push(`Will create new vendor from W-9: ${raw.legal_name || raw.business_name}.`);
+    else parts.push('Will update existing vendor with W-9 details and mark as 1099.');
   }
   return parts.join(' ');
 }
 
 async function rejectEntry(docId, entryId) {
   const reason = prompt('Rejection reason? (optional)');
-  if (reason === null) return;  // user cancelled
+  if (reason === null) return;
   const { error } = await supabase.from('pending_entries').update({
     status: 'rejected',
     rejected_reason: reason || null,
@@ -452,9 +446,6 @@ async function rejectEntry(docId, entryId) {
   await loadQueue('pending');
 }
 
-// -----------------------------------------------------------------------------
-// Compact list for processing / resolved tabs
-// -----------------------------------------------------------------------------
 function renderCompactList(docs) {
   const rows = docs.map(d => {
     const statusPill = {
@@ -468,127 +459,102 @@ function renderCompactList(docs) {
     const err = d.extraction_error
       ? `<div class="muted" style="font-size:11px;margin-top:4px">${escapeHtml(d.extraction_error.slice(0, 150))}</div>`
       : '';
+    const actions = (d.status === 'uploaded' || d.status === 'failed')
+      ? `<button class="btn-sm btn-ghost retry-btn" data-id="${d.id}">Retry</button> <button class="btn-sm btn-ghost remove-btn" data-id="${d.id}">Discard</button>`
+      : (d.status === 'approved' || d.status === 'rejected')
+      ? `<button class="btn-sm btn-ghost remove-btn" data-id="${d.id}">Hide</button>`
+      : '';
     return `<tr>
       <td>${escapeHtml(d.original_filename)}</td>
-      <td class="muted">${d.doc_type.replace('_',' ')}</td>
+      <td class="muted">${docTypeLabel(d.doc_type)}</td>
       <td>${statusPill}${err}</td>
       <td class="muted">${fmtDate(d.uploaded_at)}</td>
+      <td>${actions}</td>
     </tr>`;
   }).join('');
-  return `<div class="table-wrap"><table class="data-table">
-    <thead><tr><th>File</th><th>Type</th><th>Status</th><th>Uploaded</th></tr></thead>
+  return `<div class="table-wrap"><table class="data">
+    <thead><tr><th>File</th><th>Type</th><th>Status</th><th>Uploaded</th><th></th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
 }
 
-// -----------------------------------------------------------------------------
-// Styles specific to Inbox (injected once, scoped by class names)
-// -----------------------------------------------------------------------------
+function wireCompactActions(tab) {
+  document.querySelectorAll('.retry-btn').forEach(b => {
+    b.onclick = async () => {
+      const id = b.dataset.id;
+      toast('Retrying extraction…');
+      const { error } = await supabase.functions.invoke('extract', { body: { document_id: id } });
+      if (error) toast('Retry failed: ' + error.message, { kind: 'error' });
+      else toast('Re-extracting…', { kind: 'success' });
+      setTimeout(() => loadQueue(tab), 1500);
+    };
+  });
+  document.querySelectorAll('.remove-btn').forEach(b => {
+    b.onclick = async () => {
+      const id = b.dataset.id;
+      const ok = await confirmDialog('Hide this document?', 'It will no longer appear in the queue. The document file remains in storage.');
+      if (!ok) return;
+      // Mark rejected if not already
+      await supabase.from('documents').update({ status: 'rejected' }).eq('id', id);
+      // Mark any pending entry for this doc rejected too
+      await supabase.from('pending_entries').update({ status: 'rejected', rejected_reason: 'Hidden by user', rejected_at: new Date().toISOString() }).eq('document_id', id).eq('status', 'pending');
+      toast('Hidden', { kind: 'success' });
+      loadQueue(tab);
+    };
+  });
+}
+
 function injectInboxStyles() {
   if (document.getElementById('inbox-style')) return;
   const style = document.createElement('style');
   style.id = 'inbox-style';
   style.textContent = `
-    .upload-zone {
-      background: var(--white);
-      border: 2px dashed var(--ink-300);
-      border-radius: var(--card-radius);
-      padding: 32px;
-      text-align: center;
-      cursor: pointer;
-      transition: all 0.15s;
-      margin-bottom: 20px;
-    }
+    .upload-zone { background: var(--white); border: 2px dashed var(--ink-300); border-radius: var(--card-radius); padding: 32px; text-align: center; cursor: pointer; transition: all 0.15s; margin-bottom: 20px; }
     .upload-zone:hover { border-color: var(--sky); background: var(--ink-50); }
     .upload-zone.dragover { border-color: var(--gold); background: rgba(212,175,55,0.08); }
     .upload-zone svg { color: var(--ink-400); margin-bottom: 12px; }
     .upload-head { font-family: var(--font-display); font-size: 22px; letter-spacing: 1.2px; color: var(--navy); }
     .upload-sub { font-size: 12px; color: var(--ink-500); margin-top: 6px; }
-    .upload-type-row { max-width: 280px; margin: 18px auto 0; text-align: left; }
+    .upload-type-row { max-width: 320px; margin: 18px auto 0; text-align: left; }
     .upload-type-row select { width: 100%; padding: 8px 10px; border: var(--hairline); border-radius: var(--ctrl-radius); font-size: 13px; background: var(--white); }
-
     .inbox-tabs { display: flex; gap: 2px; border-bottom: var(--hairline); margin-bottom: 16px; }
-    .inbox-tab {
-      background: transparent; border: none; padding: 10px 16px;
-      font-family: var(--font-body); font-size: 13px; font-weight: 600;
-      color: var(--ink-500); cursor: pointer; border-bottom: 2px solid transparent;
-      transition: all 0.12s; display: inline-flex; align-items: center; gap: 8px;
-    }
+    .inbox-tab { background: transparent; border: none; padding: 10px 16px; font-family: var(--font-body); font-size: 13px; font-weight: 600; color: var(--ink-500); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.12s; display: inline-flex; align-items: center; gap: 8px; }
     .inbox-tab:hover { color: var(--navy); }
     .inbox-tab.active { color: var(--navy); border-bottom-color: var(--gold); }
-    .tab-count {
-      background: var(--ink-100); color: var(--ink-500);
-      padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700;
-    }
+    .tab-count { background: var(--ink-100); color: var(--ink-500); padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; }
     .inbox-tab.active .tab-count { background: var(--gold); color: var(--navy); }
-
-    .review-card {
-      background: var(--white); border: var(--hairline); border-radius: var(--card-radius);
-      box-shadow: var(--shadow-sm); margin-bottom: 16px; overflow: hidden;
-    }
-    .review-head {
-      display: flex; justify-content: space-between; align-items: center;
-      padding: 14px 18px; border-bottom: var(--hairline); background: var(--ink-50);
-      gap: 12px; flex-wrap: wrap;
-    }
+    .review-card { background: var(--white); border: var(--hairline); border-radius: var(--card-radius); box-shadow: var(--shadow-sm); margin-bottom: 16px; overflow: hidden; }
+    .review-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: var(--hairline); background: var(--ink-50); gap: 12px; flex-wrap: wrap; }
     .review-meta { font-size: 11px; color: var(--ink-500); }
-    .confidence {
-      display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
-      border-radius: 10px; margin-left: 8px; letter-spacing: 0.3px;
-    }
+    .confidence { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; margin-left: 8px; letter-spacing: 0.3px; }
     .confidence-high { background: var(--green-soft); color: var(--green); }
-    .confidence-med  { background: var(--amber-soft); color: var(--amber); }
-    .confidence-low  { background: var(--red-soft);   color: var(--red); }
-
+    .confidence-med { background: var(--amber-soft); color: var(--amber); }
+    .confidence-low { background: var(--red-soft); color: var(--red); }
     .review-body { display: grid; grid-template-columns: 1fr 1fr; min-height: 520px; }
     .review-preview { background: var(--ink-100); overflow: hidden; }
-    .review-preview img, .review-preview iframe {
-      width: 100%; height: 100%; min-height: 520px; border: none; display: block; object-fit: contain;
-    }
+    .review-preview img, .review-preview iframe { width: 100%; height: 100%; min-height: 520px; border: none; display: block; object-fit: contain; }
     .review-form { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
-
     .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; }
     .kv { display: flex; flex-direction: column; font-size: 13px; }
     .kv span { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-500); font-weight: 600; }
     .kv strong { color: var(--navy); margin-top: 2px; }
-
-    .line-items {
-      border-top: var(--hairline); padding-top: 10px;
-      max-height: 180px; overflow-y: auto;
-    }
-    .line-row {
-      display: grid; grid-template-columns: 2fr 1fr auto; gap: 10px;
-      padding: 5px 0; font-size: 12px; border-bottom: 1px solid var(--ink-100);
-    }
+    .ar-edit-banner { background: var(--amber-soft); color: var(--amber); padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.4; border-left: 3px solid var(--amber); }
+    .kv.ar-edit { gap: 4px; }
+    .ar-input { padding: 6px 8px; border: 1px solid var(--ink-300); border-radius: 4px; font: inherit; font-size: 13px; color: var(--navy); margin-top: 2px; }
+    .ar-input:focus { outline: none; border-color: var(--gold); }
+    .line-items { border-top: var(--hairline); padding-top: 10px; max-height: 180px; overflow-y: auto; }
+    .line-row { display: grid; grid-template-columns: 2fr 1fr auto; gap: 10px; padding: 5px 0; font-size: 12px; border-bottom: 1px solid var(--ink-100); }
     .line-row:last-child { border-bottom: none; }
     .line-desc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .num { text-align: right; }
-
-    .total-row {
-      display: flex; justify-content: flex-end; gap: 18px; font-size: 12px;
-      border-top: var(--hairline); padding-top: 10px;
-    }
+    .total-row { display: flex; justify-content: flex-end; gap: 18px; font-size: 12px; border-top: var(--hairline); padding-top: 10px; }
     .total-row span strong { margin-left: 6px; }
     .total-big { font-size: 15px; color: var(--navy); }
     .total-big strong { font-size: 17px; }
-
-    .scope { font-size: 12px; color: var(--ink-700); padding: 10px;
-      background: var(--ink-50); border-radius: 6px; border-left: 2px solid var(--sky); }
-
-    .review-actions {
-      display: flex; justify-content: flex-end; gap: 8px; margin-top: auto;
-      padding-top: 10px; border-top: var(--hairline);
-    }
-    .match-notes {
-      font-size: 11px; color: var(--ink-500); padding: 8px 10px;
-      background: var(--ink-50); border-radius: 6px; border-left: 2px solid var(--gold);
-      font-family: var(--font-mono);
-    }
-    .raw-json {
-      font-size: 11px; color: var(--ink-700); background: var(--ink-50);
-      padding: 10px; border-radius: 6px; max-height: 300px; overflow: auto;
-    }
-
+    .scope { font-size: 12px; color: var(--ink-700); padding: 10px; background: var(--ink-50); border-radius: 6px; border-left: 2px solid var(--sky); }
+    .review-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: auto; padding-top: 10px; border-top: var(--hairline); }
+    .match-notes { font-size: 11px; color: var(--ink-500); padding: 8px 10px; background: var(--ink-50); border-radius: 6px; border-left: 2px solid var(--gold); font-family: var(--font-mono); }
+    .raw-json { font-size: 11px; color: var(--ink-700); background: var(--ink-50); padding: 10px; border-radius: 6px; max-height: 300px; overflow: auto; }
     @media (max-width: 900px) {
       .review-body { grid-template-columns: 1fr; }
       .review-preview { min-height: 320px; }
