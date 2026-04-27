@@ -1,5 +1,5 @@
 // =============================================================================
-// Invoices — AR with line items, revenue accounts, aging
+// Invoices — AR with line items, revenue accounts, summary band, aging
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, daysPastDue, escapeHtml } from '../lib/format.js';
@@ -32,6 +32,7 @@ export async function renderInvoices(outlet) {
         <button class="btn-primary" id="new-inv">+ New Invoice</button>
       </div>
     </div>
+    <div id="ar-summary" class="summary-grid"></div>
     <div id="ar-aging" class="aging-grid"></div>
     <div class="toolbar">
       <input type="search" id="inv-search" placeholder="Search invoices…" class="input" style="max-width:280px">
@@ -67,11 +68,61 @@ async function loadList() {
     window.__invCustomers = customers;
     window.__invProjects = projects;
     window.__invAccounts = accounts;
+    renderSummary(window.__invAll);
     renderAging(window.__invAll);
     filterAndRender();
   } catch (e) {
     wrap.innerHTML = `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
   }
+}
+
+// Summary band: BILLED · COLLECTED · OPEN · PAID/PARTIAL counts · OVERDUE
+function renderSummary(invoices) {
+  let billed = 0, collected = 0, open = 0, overdue = 0;
+  let paidCt = 0, partialCt = 0, sentCt = 0, draftCt = 0;
+  for (const inv of invoices) {
+    if (inv.status === 'void') continue;
+    const t = Number(inv.total) || 0;
+    const p = Number(inv.amount_paid) || 0;
+    if (inv.status === 'draft') { draftCt++; continue; }
+    billed += t;
+    collected += p;
+    open += (t - p);
+    if (inv.status === 'paid') paidCt++;
+    else if (inv.status === 'partial') partialCt++;
+    else if (inv.status === 'sent') sentCt++;
+    if (inv.status !== 'paid' && (t - p) > 0 && daysPastDue(inv.due_date) > 0) {
+      overdue += (t - p);
+    }
+  }
+  const collectedPct = billed > 0 ? (collected / billed * 100) : 0;
+  document.getElementById('ar-summary').innerHTML = `
+    <div class="summary-cell">
+      <div class="muted">BILLED</div>
+      <div class="big">${fmtMoney(billed)}</div>
+      <div class="muted" style="font-size:11px">${sentCt + partialCt + paidCt} invoices${draftCt ? ` (+ ${draftCt} draft)` : ''}</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">COLLECTED</div>
+      <div class="big" style="color:var(--green)">${fmtMoney(collected)}</div>
+      <div class="muted" style="font-size:11px">${collectedPct.toFixed(1)}% of billed</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">OPEN</div>
+      <div class="big">${fmtMoney(open)}</div>
+      <div class="muted" style="font-size:11px">across ${sentCt + partialCt} invoices</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">PAID / PARTIAL</div>
+      <div class="big">${paidCt} / ${partialCt}</div>
+      <div class="muted" style="font-size:11px">paid · partially paid</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">OVERDUE</div>
+      <div class="big" style="color:var(--red)">${fmtMoney(overdue)}</div>
+      <div class="muted" style="font-size:11px">past due date</div>
+    </div>
+  `;
 }
 
 function renderAging(invoices) {
