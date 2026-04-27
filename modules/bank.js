@@ -1,10 +1,7 @@
 // =============================================================================
-// Bank — Per-account dashboard
-// Credit-aware: switches language when account_type='credit' (CHARGES, PAYMENTS,
-// AMOUNT OWED instead of WITHDRAWALS, DEPOSITS, CURRENT BALANCE).
-// Categorization: tx table has inline category picker; Spending-by-Category
-// chart for credit accounts; "Apply auto-rules" button runs categorization_rules
-// retroactively for unset tx.
+// Bank — Per-account dashboard with KPIs, charts, categorization, tx explorer
+// Credit-aware: flips language for account_type='credit' (AMOUNT OWED, CHARGES,
+// PAYMENTS instead of CURRENT BALANCE, WITHDRAWALS, DEPOSITS).
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, escapeHtml } from '../lib/format.js';
@@ -14,25 +11,31 @@ import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/s
 
 const TX_MOD = 'bank_tx';
 
-// Returns the {label} object for a given account type, used to flip terminology
-// for credit cards vs checking/savings accounts.
-function lex(acctType) {
-  const isCredit = acctType === 'credit';
+function isCredit(acct) {
+  return acct?.account_type === 'credit';
+}
+
+// Language map for credit vs debit accounts
+function lang(acct) {
+  const credit = isCredit(acct);
   return {
-    isCredit,
-    balanceLbl:    isCredit ? 'AMOUNT OWED'   : 'CURRENT BALANCE',
-    incomingLbl:   isCredit ? 'PAYMENTS'      : 'DEPOSITS',
-    outgoingLbl:   isCredit ? 'CHARGES'       : 'WITHDRAWALS',
-    netLbl:        isCredit ? 'NET ACTIVITY'  : 'NET CHANGE',
+    balanceLabel:    credit ? 'AMOUNT OWED'      : 'CURRENT BALANCE',
+    depositsLabel:   credit ? 'PAYMENTS MADE'    : 'DEPOSITS',
+    withdrawalsLabel:credit ? 'CHARGES'          : 'WITHDRAWALS',
+    netLabel:        credit ? 'NET CHANGE'       : 'NET CHANGE',
+    txTitle:         credit ? 'TRANSACTIONS'     : 'TRANSACTIONS',
+    // For credit cards, "deposit" in the data means a payment (reduces balance owed),
+    // and "withdrawal" means a charge (increases balance owed). We re-color accordingly:
+    // green for payments (good), red for charges (cost). Same as default but labels differ.
   };
 }
 
 const TX_COLUMNS = [
   { key: 'date',          label: 'Date',        type: 'date' },
   { key: 'description',   label: 'Description', type: 'string' },
+  { key: 'category_name', label: 'Category',    type: 'string', get: r => r._categoryName || '' },
   { key: 'amount',        label: 'Amount',      type: 'number', numeric: true },
   { key: 'balance_after', label: 'Balance',     type: 'number', numeric: true },
-  { key: 'category',      label: 'Category',    type: 'string', get: r => r._cat?.name || '' },
   { key: 'reconciled',    label: 'Reconciled',  type: 'number', get: r => r.reconciled ? 1 : 0 },
 ];
 
@@ -41,15 +44,17 @@ export async function renderBank(outlet) {
     <div class="page-head">
       <div class="page-head-left">
         <h1>BANK</h1>
-        <div class="page-head-sub">Cash + credit dashboard per account</div>
+        <div class="page-head-sub">Cash dashboard per account</div>
       </div>
       <div class="page-head-right">
+        <button class="btn-secondary" id="apply-rules-btn">Apply Rules to All</button>
         <button class="btn-secondary" id="manage-accts">Manage Accounts</button>
       </div>
     </div>
     <div id="bank-area"><div class="empty-state"><div class="big">LOADING</div></div></div>
   `;
   document.getElementById('manage-accts').onclick = () => openAccountManager();
+  document.getElementById('apply-rules-btn').onclick = () => applyRulesToAll();
   await loadAll();
 }
 
@@ -67,10 +72,16 @@ async function loadAll() {
       return;
     }
     const catMap = new Map(cats.map(c => [c.id, c]));
+    // Decorate tx with category name + color
+    for (const t of allTx) {
+      const cat = catMap.get(t.category_id);
+      t._categoryName = cat?.name || '';
+      t._categoryColor = cat?.color || null;
+    }
     window.__bankAccts = accts;
+    window.__bankTxAll = allTx;
     window.__bankCats = cats;
     window.__bankRules = rules;
-    window.__bankTxAll = allTx.map(t => ({ ...t, _cat: t.category_id ? catMap.get(t.category_id) : null }));
     const sel = window.__selectedAcctId && accts.find(a => a.id === window.__selectedAcctId)
       ? window.__selectedAcctId
       : accts[0].id;
@@ -83,10 +94,13 @@ async function loadAll() {
 
 function renderDashboard() {
   const accts = window.__bankAccts || [];
+  const allTx = window.__bankTxAll || [];
+  const cats = window.__bankCats || [];
   const acctId = window.__selectedAcctId;
   const acct = accts.find(a => a.id === acctId);
-  const txs = (window.__bankTxAll || []).filter(t => t.bank_account_id === acctId);
-  const L = lex(acct?.account_type);
+  const credit = isCredit(acct);
+  const L = lang(acct);
+  const txs = allTx.filter(t => t.bank_account_id === acctId);
 
   const sortedDesc = [...txs].sort((a, b) =>
     b.date.localeCompare(a.date) || (b.created_at || '').localeCompare(a.created_at || '')
@@ -97,14 +111,10 @@ function renderDashboard() {
     : Number(acct?.current_balance || 0);
   const balanceAsOfDate = latestWithBalance ? latestWithBalance.date : (sortedDesc[0]?.date || null);
 
-  // For credit accounts, "incoming" = payments made (negative amount on statement),
-  // "outgoing" = charges (positive amount on statement). For checking, opposite.
-  // We treat the sign convention as: positive amount = money in, negative = money out
-  // (which is what bank statements typically extract). For credit cards, charges are
-  // negative (you owe more) and payments are positive (you owe less). The Edge Function
-  // already encodes this consistently.
-  let incoming = 0, outgoing = 0;
-  let latestPeriodLabel = '', latestPeriodKey = '';
+  // "Latest period" aggregates
+  let mDeposits = 0, mWithdrawals = 0;
+  let latestPeriodLabel = '';
+  let latestPeriodKey = '';
   if (sortedDesc.length) {
     latestPeriodKey = sortedDesc[0].date.slice(0, 7);
     const periodStart = latestPeriodKey + '-01';
@@ -112,26 +122,26 @@ function renderDashboard() {
     for (const t of txs) {
       if (t.date < periodStart || t.date > periodEnd) continue;
       const a = Number(t.amount);
-      if (a > 0) incoming += a;
-      else outgoing += a;
+      if (a > 0) mDeposits += a;
+      else mWithdrawals += a;
     }
     const d = new Date(periodStart + 'T00:00:00');
     latestPeriodLabel = d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   }
-  const net = incoming + outgoing;
+  const mNet = mDeposits + mWithdrawals;
 
-  // Statement period for the meta strip
   const lastBatchId = sortedDesc.length ? sortedDesc[0].import_batch_id : null;
   const lastBatchTx = lastBatchId ? txs.filter(t => t.import_batch_id === lastBatchId) : [];
   const batchStart = lastBatchTx.length ? lastBatchTx.reduce((m, t) => t.date < m ? t.date : m, lastBatchTx[0].date) : null;
   const batchEnd = lastBatchTx.length ? lastBatchTx.reduce((m, t) => t.date > m ? t.date : m, lastBatchTx[0].date) : null;
 
-  // Uncategorized count
-  const unCatCount = txs.filter(t => !t.category_id).length;
+  // Uncategorized count (for badge)
+  const uncatCount = txs.filter(t => !t.category_id).length;
 
   const acctOpts = accts.map(a => {
-    const tag = a.account_type === 'credit' ? '[CREDIT] ' : '';
-    return `<option value="${a.id}" ${a.id === acctId ? 'selected' : ''}>${tag}${escapeHtml(a.name)} ····${a.last4 || '—'}</option>`;
+    const isC = isCredit(a);
+    const tag = isC ? '💳' : '🏦';
+    return `<option value="${a.id}" ${a.id === acctId ? 'selected' : ''}>${tag} ${escapeHtml(a.name)} ····${a.last4 || '—'}</option>`;
   }).join('');
 
   document.getElementById('bank-area').innerHTML = `
@@ -139,11 +149,11 @@ function renderDashboard() {
       <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
         <div>
           <div class="muted" style="font-size:11px;letter-spacing:0.5px;text-transform:uppercase">Account</div>
-          <select id="acct-picker" class="select" style="min-width:280px;font-size:14px;font-weight:600">${acctOpts}</select>
+          <select id="acct-picker" class="select" style="min-width:300px;font-size:14px;font-weight:600">${acctOpts}</select>
         </div>
         <div style="border-left:1px solid var(--hairline);padding-left:14px">
           <div class="muted" style="font-size:11px;letter-spacing:0.5px;text-transform:uppercase">Type</div>
-          <div style="font-weight:600;${L.isCredit ? 'color:var(--gold)' : ''}">${escapeHtml((acct?.account_type || '').toUpperCase())}</div>
+          <div style="font-weight:600">${escapeHtml((acct?.account_type || '').toUpperCase())}${credit ? ' 💳' : ''}</div>
         </div>
         <div style="border-left:1px solid var(--hairline);padding-left:14px">
           <div class="muted" style="font-size:11px;letter-spacing:0.5px;text-transform:uppercase">Last 4</div>
@@ -154,8 +164,12 @@ function renderDashboard() {
           <div class="muted" style="font-size:11px;letter-spacing:0.5px;text-transform:uppercase">Latest Statement</div>
           <div style="font-weight:600">${fmtDate(batchStart)} → ${fmtDate(batchEnd)}</div>
         </div>` : ''}
+        ${uncatCount > 0 ? `
+        <div style="border-left:1px solid var(--hairline);padding-left:14px">
+          <div class="muted" style="font-size:11px;letter-spacing:0.5px;text-transform:uppercase">Needs Category</div>
+          <div style="font-weight:600;color:var(--amber)">${uncatCount} tx</div>
+        </div>` : ''}
         <div style="margin-left:auto;display:flex;gap:8px">
-          ${unCatCount > 0 ? `<button class="btn-sm btn-primary" id="apply-rules-btn">Apply Rules (${unCatCount} uncat.)</button>` : ''}
           <button class="btn-sm btn-ghost" id="import-csv-btn">Import CSV</button>
         </div>
       </div>
@@ -163,29 +177,29 @@ function renderDashboard() {
 
     <div class="summary-grid" style="margin-bottom:14px">
       <div class="summary-cell">
-        <div class="muted">${L.balanceLbl}</div>
-        <div class="big" style="${L.isCredit && liveBalance < 0 ? 'color:var(--red)' : ''}">${fmtMoney(L.isCredit ? Math.abs(liveBalance) : liveBalance)}</div>
+        <div class="muted">${L.balanceLabel}</div>
+        <div class="big" style="${credit && liveBalance > 0 ? 'color:var(--red)' : ''}">${fmtMoney(liveBalance)}</div>
         <div class="muted" style="font-size:11px">${balanceAsOfDate ? `as of ${fmtDate(balanceAsOfDate)}` : 'no transactions yet'}</div>
       </div>
       <div class="summary-cell">
-        <div class="muted">${L.incomingLbl}</div>
-        <div class="big" style="color:var(--green)">${fmtMoney(incoming)}</div>
+        <div class="muted">${L.depositsLabel}</div>
+        <div class="big" style="color:var(--green)">${fmtMoney(mDeposits)}</div>
         <div class="muted" style="font-size:11px">${latestPeriodLabel || 'no data'}</div>
       </div>
       <div class="summary-cell">
-        <div class="muted">${L.outgoingLbl}</div>
-        <div class="big" style="color:var(--red)">${fmtMoney(Math.abs(outgoing))}</div>
+        <div class="muted">${L.withdrawalsLabel}</div>
+        <div class="big" style="color:var(--red)">${fmtMoney(Math.abs(mWithdrawals))}</div>
         <div class="muted" style="font-size:11px">${latestPeriodLabel || 'no data'}</div>
       </div>
       <div class="summary-cell">
-        <div class="muted">${L.netLbl}</div>
-        <div class="big" style="color:${net >= 0 ? 'var(--green)' : 'var(--red)'}">${net >= 0 ? '+' : ''}${fmtMoney(net)}</div>
+        <div class="muted">${L.netLabel}</div>
+        <div class="big" style="color:${mNet >= 0 ? 'var(--green)' : 'var(--red)'}">${mNet >= 0 ? '+' : ''}${fmtMoney(mNet)}</div>
         <div class="muted" style="font-size:11px">${latestPeriodLabel ? `for ${latestPeriodLabel}` : 'no data'}</div>
       </div>
       <div class="summary-cell">
         <div class="muted">TRANSACTIONS</div>
         <div class="big">${txs.length}</div>
-        <div class="muted" style="font-size:11px">${unCatCount > 0 ? `<span style="color:var(--amber)">${unCatCount} uncategorized</span>` : 'all categorized'}</div>
+        <div class="muted" style="font-size:11px">total on file</div>
       </div>
     </div>
 
@@ -199,50 +213,46 @@ function renderDashboard() {
 
     <div class="card" style="margin-bottom:14px">
       <div class="card-header">
-        <div class="section-title">${L.incomingLbl} VS ${L.outgoingLbl} BY MONTH</div>
+        <div class="section-title">${credit ? 'CHARGES VS PAYMENTS' : 'DEPOSITS VS WITHDRAWALS'} BY MONTH</div>
         <div class="muted" style="font-size:11px">Last 12 months</div>
       </div>
       <div id="month-chart"></div>
     </div>
 
     <div class="card" style="margin-bottom:14px">
-      <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-        <div>
-          <div class="section-title">SPENDING BY CATEGORY</div>
-          <div class="muted" style="font-size:11px">Where the money went</div>
-        </div>
-        <div style="display:flex;gap:6px;align-items:center">
-          <label class="muted" style="font-size:11px">Range</label>
-          <select id="cat-range" class="select" style="font-size:12px">
-            <option value="latest">Latest period</option>
+      <div class="card-header">
+        <div class="section-title">SPENDING BY CATEGORY</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="cat-range" class="select" style="font-size:11px;padding:4px 8px">
             <option value="ytd" selected>Year to date</option>
+            <option value="month">Latest month</option>
+            <option value="quarter">Last 3 months</option>
             <option value="all">All time</option>
-            <option value="lastperiod">Last completed period</option>
           </select>
         </div>
       </div>
-      <div id="cat-chart"></div>
+      <div id="category-chart"></div>
     </div>
 
     <div class="card">
       <div class="card-header">
-        <div class="section-title">TRANSACTIONS</div>
+        <div class="section-title">${L.txTitle}</div>
       </div>
       <div class="toolbar">
-        <input type="search" id="tx-search" placeholder="Search description…" class="input" style="max-width:220px">
+        <input type="search" id="tx-search" placeholder="Search description…" class="input" style="max-width:280px">
         <label class="muted" style="font-size:11px">From</label>
         <input class="input" id="tx-from" type="date" style="max-width:160px">
         <label class="muted" style="font-size:11px">To</label>
         <input class="input" id="tx-to" type="date" style="max-width:160px">
         <select id="tx-type" class="select" style="max-width:160px">
           <option value="">All types</option>
-          <option value="deposits">${L.incomingLbl} only</option>
-          <option value="withdrawals">${L.outgoingLbl} only</option>
+          <option value="deposits">${credit ? 'Payments only' : 'Deposits only'}</option>
+          <option value="withdrawals">${credit ? 'Charges only' : 'Withdrawals only'}</option>
         </select>
         <select id="tx-cat" class="select" style="max-width:200px">
           <option value="">All categories</option>
-          <option value="__none__">— Uncategorized —</option>
-          ${(window.__bankCats || []).map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('')}
+          <option value="__uncat">Uncategorized only</option>
+          ${cats.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('')}
         </select>
         <select id="tx-recon" class="select" style="max-width:160px">
           <option value="">All</option>
@@ -260,14 +270,12 @@ function renderDashboard() {
     renderDashboard();
   };
   document.getElementById('import-csv-btn').onclick = () => importCSV(acctId, () => loadAll());
-  const arBtn = document.getElementById('apply-rules-btn');
-  if (arBtn) arBtn.onclick = () => applyRulesRetroactively(acctId, () => loadAll());
+  document.getElementById('cat-range').onchange = () => drawCategoryChart(txs);
 
-  drawBalanceChart(txs, L);
-  drawMonthChart(txs, L);
-  drawCategoryChart();
+  drawBalanceChart(txs);
+  drawMonthChart(txs, credit);
+  drawCategoryChart(txs);
 
-  document.getElementById('cat-range').onchange = drawCategoryChart;
   document.getElementById('tx-search').oninput = renderTxTable;
   document.getElementById('tx-from').onchange = renderTxTable;
   document.getElementById('tx-to').onchange = renderTxTable;
@@ -287,13 +295,14 @@ function renderDashboard() {
 function renderTxTable() {
   const acctId = window.__selectedAcctId;
   const allTx = window.__bankTxAll || [];
+  const cats = window.__bankCats || [];
   let txs = allTx.filter(t => t.bank_account_id === acctId);
 
   const term = (document.getElementById('tx-search')?.value || '').trim().toLowerCase();
   const from = document.getElementById('tx-from')?.value || '';
   const to = document.getElementById('tx-to')?.value || '';
   const type = document.getElementById('tx-type')?.value || '';
-  const catFilter = document.getElementById('tx-cat')?.value || '';
+  const cat = document.getElementById('tx-cat')?.value || '';
   const recon = document.getElementById('tx-recon')?.value || '';
 
   if (term) txs = txs.filter(t => (t.description || '').toLowerCase().includes(term));
@@ -301,8 +310,8 @@ function renderTxTable() {
   if (to) txs = txs.filter(t => t.date <= to);
   if (type === 'deposits') txs = txs.filter(t => Number(t.amount) > 0);
   if (type === 'withdrawals') txs = txs.filter(t => Number(t.amount) < 0);
-  if (catFilter === '__none__') txs = txs.filter(t => !t.category_id);
-  else if (catFilter) txs = txs.filter(t => t.category_id === catFilter);
+  if (cat === '__uncat') txs = txs.filter(t => !t.category_id);
+  else if (cat) txs = txs.filter(t => t.category_id === cat);
   if (recon === 'reconciled') txs = txs.filter(t => t.reconciled);
   if (recon === 'unreconciled') txs = txs.filter(t => !t.reconciled);
 
@@ -319,10 +328,10 @@ function renderTxTable() {
     return acc;
   }, { deposits: 0, withdrawals: 0 });
 
-  const cats = window.__bankCats || [];
-  const catOpts = (selId) => `<option value="">— Uncat. —</option>` + cats.map(c =>
-    `<option value="${c.id}" ${c.id === selId ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
-  ).join('');
+  const catOpts = (selectedId) => `
+    <option value="">— Uncategorized —</option>
+    ${cats.map(c => `<option value="${c.id}" ${c.id === selectedId ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
+  `;
 
   const state = getSortState(TX_MOD, { key: 'date', dir: 'desc' });
   const sorted = sortRows(txs, TX_COLUMNS, state);
@@ -331,21 +340,21 @@ function renderTxTable() {
       <thead><tr>${headerHTML(TX_COLUMNS, state)}</tr></thead>
       <tbody>
         ${sorted.map(t => `
-          <tr>
+          <tr data-tx-id="${t.id}">
             <td>${fmtDate(t.date)}</td>
             <td>${escapeHtml(t.description || '')}</td>
+            <td>
+              <select class="select cat-picker" data-tx-id="${t.id}" style="font-size:11px;padding:3px 6px;${t._categoryColor ? `border-left:3px solid ${t._categoryColor}` : ''}">${catOpts(t.category_id)}</select>
+            </td>
             <td class="numeric ${Number(t.amount) < 0 ? 'delta-down' : 'delta-up'}">${fmtMoney(t.amount)}</td>
             <td class="numeric">${t.balance_after != null ? fmtMoney(t.balance_after) : '<span class="muted">—</span>'}</td>
-            <td>
-              <select class="select cat-picker" data-id="${t.id}" style="font-size:11px;padding:4px 6px;background:${t._cat?.color || 'transparent'}${t._cat ? '33' : ''};border-color:${t._cat?.color || 'var(--hairline)'};">${catOpts(t.category_id)}</select>
-            </td>
             <td>${t.reconciled ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-amber">PENDING</span>'}</td>
           </tr>
         `).join('')}
       </tbody>
       <tfoot>
         <tr style="font-weight:600;background:var(--ink-50)">
-          <td colspan="2"><strong>${txs.length} transactions</strong></td>
+          <td colspan="3"><strong>${txs.length} transactions</strong></td>
           <td class="numeric">
             <div class="delta-up">+${fmtMoney(totals.deposits)}</div>
             <div class="delta-down">${fmtMoney(totals.withdrawals)}</div>
@@ -353,48 +362,46 @@ function renderTxTable() {
               <strong>${(totals.deposits + totals.withdrawals) >= 0 ? '+' : ''}${fmtMoney(totals.deposits + totals.withdrawals)}</strong>
             </div>
           </td>
-          <td colspan="3"></td>
+          <td colspan="2"></td>
         </tr>
       </tfoot>
     </table>
   `;
+  attachSortHandlers(wrap, TX_MOD, () => renderTxTable());
 
   // Wire up inline category pickers
   wrap.querySelectorAll('.cat-picker').forEach(sel => {
-    sel.addEventListener('change', async (e) => {
-      const txId = sel.dataset.id;
-      const newCatId = sel.value || null;
+    sel.onchange = async (e) => {
+      const txId = e.target.dataset.txId;
+      const newCatId = e.target.value || null;
       try {
         await q(supabase.from('bank_transactions').update({ category_id: newCatId }).eq('id', txId));
-        // Update local state without full reload
-        const local = (window.__bankTxAll || []).find(t => t.id === txId);
-        if (local) {
-          local.category_id = newCatId;
-          local._cat = newCatId ? (window.__bankCats || []).find(c => c.id === newCatId) : null;
+        // Update local cache so we don't have to refetch
+        const tx = (window.__bankTxAll || []).find(t => t.id === txId);
+        if (tx) {
+          tx.category_id = newCatId;
+          const cat = (window.__bankCats || []).find(c => c.id === newCatId);
+          tx._categoryName = cat?.name || '';
+          tx._categoryColor = cat?.color || null;
+          if (cat) e.target.style.borderLeft = `3px solid ${cat.color}`;
+          else e.target.style.borderLeft = '';
         }
-        toast('Category updated', { kind: 'success', ms: 1500 });
-        renderTxTable();
-        drawCategoryChart();
-        // Update KPI strip's uncategorized count
-        const accts = window.__bankAccts || [];
+        // Re-render the spending-by-category chart so it reflects the new categorization
         const acctTxs = (window.__bankTxAll || []).filter(t => t.bank_account_id === window.__selectedAcctId);
-        const unCatCount = acctTxs.filter(t => !t.category_id).length;
-        const arBtn = document.getElementById('apply-rules-btn');
-        if (arBtn) arBtn.textContent = unCatCount > 0 ? `Apply Rules (${unCatCount} uncat.)` : 'Apply Rules';
+        drawCategoryChart(acctTxs);
+        toast('Category saved', { kind: 'success', ms: 1500 });
       } catch (err) {
-        toast('Failed to update category: ' + err.message, { kind: 'error' });
+        toast('Save failed: ' + err.message, { kind: 'error' });
       }
-    });
+    };
   });
-
-  attachSortHandlers(wrap, TX_MOD, () => renderTxTable());
 }
 
 // =============================================================================
 // SVG charts
 // =============================================================================
 
-function drawBalanceChart(txs, L) {
+function drawBalanceChart(txs) {
   const wrap = document.getElementById('balance-chart');
   const points = txs.filter(t => t.balance_after != null).map(t => ({
     date: t.date, balance: Number(t.balance_after),
@@ -432,16 +439,16 @@ function drawBalanceChart(txs, L) {
   wrap.innerHTML = `
     <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;font-family:inherit">
       ${yLabels.map(t => `<line x1="${M.l}" y1="${t.ypx}" x2="${M.l + innerW}" y2="${t.ypx}" stroke="var(--hairline)" stroke-width="1"/>`).join('')}
-      <path d="${fillPath}" fill="${L.isCredit ? 'var(--red)' : 'var(--gold-soft)'}" opacity="0.3"/>
-      <path d="${path}" fill="none" stroke="${L.isCredit ? 'var(--red)' : 'var(--gold)'}" stroke-width="2"/>
-      ${dotIdxs.map(i => `<circle cx="${x(i).toFixed(1)}" cy="${y(series[i].balance).toFixed(1)}" r="3" fill="${L.isCredit ? 'var(--red)' : 'var(--gold)'}"><title>${series[i].date}: $${series[i].balance.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title></circle>`).join('')}
+      <path d="${fillPath}" fill="var(--gold-soft)" opacity="0.4"/>
+      <path d="${path}" fill="none" stroke="var(--gold)" stroke-width="2"/>
+      ${dotIdxs.map(i => `<circle cx="${x(i).toFixed(1)}" cy="${y(series[i].balance).toFixed(1)}" r="3" fill="var(--gold)"><title>${series[i].date}: $${series[i].balance.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title></circle>`).join('')}
       ${yLabels.map(t => `<text x="${M.l - 8}" y="${t.ypx + 4}" text-anchor="end" font-size="10" fill="var(--ink-500)">$${Math.round(t.v).toLocaleString()}</text>`).join('')}
       ${xTickIdxs.map(i => `<text x="${x(i).toFixed(1)}" y="${H - 10}" text-anchor="middle" font-size="10" fill="var(--ink-500)">${shortDate(series[i].date)}</text>`).join('')}
     </svg>
   `;
 }
 
-function drawMonthChart(txs, L) {
+function drawMonthChart(txs, credit) {
   const wrap = document.getElementById('month-chart');
   if (!txs.length) {
     wrap.innerHTML = `<div class="empty-state"><div class="muted">No data yet.</div></div>`;
@@ -473,6 +480,9 @@ function drawMonthChart(txs, L) {
   const barW = Math.min(groupW * 0.35, 24);
   const y = (v) => M.t + innerH * (1 - (v - yMin) / range);
 
+  const depLbl = credit ? 'Payments' : 'Deposits';
+  const wdLbl = credit ? 'Charges' : 'Withdrawals';
+
   wrap.innerHTML = `
     <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;font-family:inherit">
       <line x1="${M.l}" y1="${zeroY}" x2="${M.l + innerW}" y2="${zeroY}" stroke="var(--hairline-dark)" stroke-width="1"/>
@@ -488,10 +498,10 @@ function drawMonthChart(txs, L) {
         const wHeight = Math.abs(y(v.withdrawals) - zeroY);
         return `
           <rect x="${cx - barW - 1}" y="${depTop}" width="${barW}" height="${depHeight}" fill="var(--green)" opacity="0.85">
-            <title>${m} ${L.incomingLbl.toLowerCase()}: $${v.deposits.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title>
+            <title>${m} ${depLbl.toLowerCase()}: $${v.deposits.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title>
           </rect>
           <rect x="${cx + 1}" y="${zeroY}" width="${barW}" height="${wHeight}" fill="var(--red)" opacity="0.85">
-            <title>${m} ${L.outgoingLbl.toLowerCase()}: $${Math.abs(v.withdrawals).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title>
+            <title>${m} ${wdLbl.toLowerCase()}: $${Math.abs(v.withdrawals).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title>
           </rect>
           <text x="${cx}" y="${H - 18}" text-anchor="middle" font-size="10" fill="var(--ink-500)">${monthLabel(m)}</text>
           <text x="${cx}" y="${H - 6}" text-anchor="middle" font-size="9" fill="${(v.deposits + v.withdrawals) >= 0 ? 'var(--green)' : 'var(--red)'}" font-weight="600">${(v.deposits + v.withdrawals) >= 0 ? '+' : ''}$${Math.round(v.deposits + v.withdrawals).toLocaleString()}</text>
@@ -499,94 +509,88 @@ function drawMonthChart(txs, L) {
       }).join('')}
       <g transform="translate(${M.l + 8}, ${M.t + 12})">
         <rect width="10" height="10" fill="var(--green)" opacity="0.85"/>
-        <text x="14" y="9" font-size="10" fill="var(--ink-700)">${L.incomingLbl}</text>
-        <rect x="${L.outgoingLbl.length * 6 + 30}" width="10" height="10" fill="var(--red)" opacity="0.85"/>
-        <text x="${L.outgoingLbl.length * 6 + 44}" y="9" font-size="10" fill="var(--ink-700)">${L.outgoingLbl}</text>
+        <text x="14" y="9" font-size="10" fill="var(--ink-700)">${depLbl}</text>
+        <rect x="80" width="10" height="10" fill="var(--red)" opacity="0.85"/>
+        <text x="94" y="9" font-size="10" fill="var(--ink-700)">${wdLbl}</text>
       </g>
     </svg>
   `;
 }
 
-// Spending by category — horizontal bar chart, filterable by date range
-function drawCategoryChart() {
-  const wrap = document.getElementById('cat-chart');
-  if (!wrap) return;
-  const acctId = window.__selectedAcctId;
-  const accts = window.__bankAccts || [];
-  const acct = accts.find(a => a.id === acctId);
+function drawCategoryChart(txs) {
+  const wrap = document.getElementById('category-chart');
   const cats = window.__bankCats || [];
-  const txs = (window.__bankTxAll || []).filter(t => t.bank_account_id === acctId);
   const range = document.getElementById('cat-range')?.value || 'ytd';
 
-  // Determine date window
-  const sortedDesc = [...txs].sort((a, b) => b.date.localeCompare(a.date));
+  // Date filter
   const today = new Date();
-  let dateFrom = '', dateTo = '9999-99-99';
-  if (range === 'latest' && sortedDesc.length) {
-    const k = sortedDesc[0].date.slice(0, 7);
-    dateFrom = k + '-01';
-    dateTo = k + '-31';
-  } else if (range === 'lastperiod' && sortedDesc.length) {
-    // The latest period's predecessor
-    const periods = [...new Set(txs.map(t => t.date.slice(0, 7)))].sort();
-    const last = periods[periods.length - 2];
-    if (last) { dateFrom = last + '-01'; dateTo = last + '-31'; }
-  } else if (range === 'ytd') {
-    dateFrom = today.getFullYear() + '-01-01';
+  let startDate = null;
+  if (range === 'ytd') {
+    startDate = `${today.getFullYear()}-01-01`;
+  } else if (range === 'month') {
+    // Latest month with tx
+    const sorted = [...txs].sort((a, b) => b.date.localeCompare(a.date));
+    if (sorted.length) startDate = sorted[0].date.slice(0, 7) + '-01';
+  } else if (range === 'quarter') {
+    const d = new Date();
+    d.setMonth(d.getMonth() - 3);
+    startDate = fmtDateISO(d);
   }
   // 'all' = no filter
 
-  const filtered = txs.filter(t => t.date >= dateFrom && t.date <= dateTo);
-  // Aggregate spending (negative amounts) by category
-  const byCat = new Map();
-  let uncat = 0;
-  let totalSpend = 0;
-  for (const t of filtered) {
-    const a = Number(t.amount);
-    if (a >= 0) continue; // only spending
-    const spend = Math.abs(a);
-    totalSpend += spend;
-    if (!t.category_id) {
-      uncat += spend;
-      continue;
-    }
-    byCat.set(t.category_id, (byCat.get(t.category_id) || 0) + spend);
-  }
+  let filtered = txs;
+  if (startDate) filtered = txs.filter(t => t.date >= startDate);
+  // Only count outflows (charges/withdrawals) for "spending"
+  filtered = filtered.filter(t => Number(t.amount) < 0);
 
-  const rows = [...byCat.entries()].map(([cid, amt]) => {
-    const cat = cats.find(c => c.id === cid);
-    return { name: cat?.name || 'Unknown', color: cat?.color || '#888', amount: amt };
-  }).sort((a, b) => b.amount - a.amount);
-
-  if (uncat > 0) rows.push({ name: 'Uncategorized', color: '#FFD580', amount: uncat });
-
-  if (!rows.length || totalSpend === 0) {
-    wrap.innerHTML = `<div class="empty-state"><div class="muted">No spending in this period.</div></div>`;
+  if (!filtered.length) {
+    wrap.innerHTML = `<div class="empty-state"><div class="muted">No spending transactions in this period.</div></div>`;
     return;
   }
 
-  const max = rows[0].amount;
-  const W = 900, rowH = 32, M = { l: 200, r: 100, t: 14, b: 14 };
-  const H = M.t + M.b + rowH * rows.length;
-  const innerW = W - M.l - M.r;
+  // Aggregate by category
+  const byCat = new Map();
+  let uncat = 0;
+  for (const t of filtered) {
+    const amt = Math.abs(Number(t.amount));
+    if (!t.category_id) {
+      uncat += amt;
+      continue;
+    }
+    byCat.set(t.category_id, (byCat.get(t.category_id) || 0) + amt);
+  }
 
+  const rows = [...byCat.entries()].map(([catId, amt]) => {
+    const c = cats.find(c => c.id === catId);
+    return { name: c?.name || 'Unknown', color: c?.color || '#888', amount: amt };
+  }).sort((a, b) => b.amount - a.amount);
+
+  if (uncat > 0) {
+    rows.push({ name: 'Uncategorized', color: '#CCCCCC', amount: uncat });
+  }
+
+  const totalSpend = rows.reduce((s, r) => s + r.amount, 0);
+  const maxAmt = Math.max(...rows.map(r => r.amount));
+
+  // Horizontal bar chart
   wrap.innerHTML = `
-    <div style="margin-bottom:8px" class="muted">Total spending: <strong>${fmtMoney(totalSpend)}</strong> across ${rows.length} categor${rows.length === 1 ? 'y' : 'ies'}</div>
-    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;font-family:inherit">
-      ${rows.map((r, i) => {
-        const yTop = M.t + i * rowH;
-        const barW = (r.amount / max) * innerW;
-        const pct = (r.amount / totalSpend * 100).toFixed(1);
+    <div style="display:flex;flex-direction:column;gap:8px;padding:8px 0">
+      <div class="muted" style="font-size:11px;margin-bottom:4px">Total spending: <strong>${fmtMoney(totalSpend)}</strong> across ${rows.length} ${rows.length === 1 ? 'category' : 'categories'}</div>
+      ${rows.map(r => {
+        const pct = totalSpend > 0 ? (r.amount / totalSpend * 100) : 0;
+        const widthPct = maxAmt > 0 ? (r.amount / maxAmt * 100) : 0;
         return `
-          <text x="${M.l - 10}" y="${yTop + rowH/2 + 4}" text-anchor="end" font-size="12" fill="var(--ink-700)" font-weight="500">${escapeHtml(r.name)}</text>
-          <rect x="${M.l}" y="${yTop + 8}" width="${barW.toFixed(1)}" height="${rowH - 16}" fill="${r.color}" rx="3">
-            <title>${r.name}: $${r.amount.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})} (${pct}% of total)</title>
-          </rect>
-          <text x="${M.l + barW + 6}" y="${yTop + rowH/2 + 4}" font-size="11" fill="var(--ink-700)" font-weight="600">$${Math.round(r.amount).toLocaleString()}</text>
-          <text x="${M.l + barW + 6}" y="${yTop + rowH/2 + 17}" font-size="9" fill="var(--ink-500)">${pct}%</text>
+          <div style="display:grid;grid-template-columns:180px 1fr 100px 60px;gap:10px;align-items:center;font-size:13px">
+            <div style="display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:10px;height:10px;background:${r.color};border-radius:2px"></span>${escapeHtml(r.name)}</div>
+            <div style="background:var(--ink-50);height:18px;border-radius:3px;overflow:hidden;position:relative">
+              <div style="background:${r.color};height:100%;width:${widthPct.toFixed(1)}%;opacity:0.85"></div>
+            </div>
+            <div class="numeric mono" style="font-weight:600">${fmtMoney(r.amount)}</div>
+            <div class="muted" style="font-size:11px;text-align:right">${pct.toFixed(1)}%</div>
+          </div>
         `;
       }).join('')}
-    </svg>
+    </div>
   `;
 }
 
@@ -602,59 +606,49 @@ function monthLabel(ym) {
 }
 
 // =============================================================================
-// Apply categorization rules retroactively to all uncategorized tx
+// Apply rules to all transactions retroactively
 // =============================================================================
 
-async function applyRulesRetroactively(acctId, onDone) {
-  const rules = window.__bankRules || [];
-  if (!rules.length) {
-    toast('No rules defined yet. Go to Settings → Categories & Rules to add some.', { kind: 'error', ms: 4000 });
-    return;
-  }
-  const allTx = window.__bankTxAll || [];
-  const uncatTx = allTx.filter(t => t.bank_account_id === acctId && !t.category_id);
-  if (!uncatTx.length) {
-    toast('All transactions already categorized.', { kind: 'success' });
-    return;
-  }
-
-  // For each uncategorized tx, find first matching rule (priority asc, length desc)
-  const updates = [];
-  for (const t of uncatTx) {
-    const desc = (t.description || '').toLowerCase();
-    let match = null;
-    for (const r of rules) {
-      const m = (r.match_text || '').toLowerCase();
-      let isMatch = false;
-      if (r.match_type === 'contains') isMatch = desc.includes(m);
-      else if (r.match_type === 'starts_with') isMatch = desc.startsWith(m);
-      else if (r.match_type === 'exact') isMatch = desc === m;
-      if (isMatch) { match = r; break; }  // rules are pre-sorted by priority
-    }
-    if (match) updates.push({ id: t.id, category_id: match.category_id });
-  }
-
-  if (!updates.length) {
-    toast(`No rules matched any of the ${uncatTx.length} uncategorized transactions.`, { kind: 'info', ms: 4000 });
-    return;
-  }
-
+async function applyRulesToAll() {
   const ok = await confirmDialog(
-    `Apply ${updates.length} categorizations?`,
-    `${updates.length} of ${uncatTx.length} uncategorized transactions match an existing rule and will be auto-tagged.`
+    'Apply categorization rules?',
+    'This will run all active rules against ALL transactions and update categories where a rule matches. Existing categorizations will be overwritten if a rule matches.'
   );
   if (!ok) return;
-
-  let success = 0, fail = 0;
-  for (const u of updates) {
-    const { error } = await supabase
-      .from('bank_transactions')
-      .update({ category_id: u.category_id })
-      .eq('id', u.id);
-    if (error) fail++; else success++;
+  try {
+    toast('Applying rules…', { ms: 2000 });
+    // Fetch fresh rules and tx
+    const [rules, txs] = await Promise.all([
+      q(supabase.from('categorization_rules').select('*').eq('is_active', true).order('priority')),
+      q(supabase.from('bank_transactions').select('id, description, category_id')),
+    ]);
+    if (!rules.length) {
+      toast('No rules defined yet. Add some in Settings → Categories & Rules.', { kind: 'error', ms: 4000 });
+      return;
+    }
+    let updated = 0;
+    for (const tx of txs) {
+      const desc = (tx.description || '').toLowerCase();
+      let matched = null;
+      for (const r of rules) {
+        const m = (r.match_text || '').toLowerCase();
+        if (!m) continue;
+        let hit = false;
+        if (r.match_type === 'contains') hit = desc.includes(m);
+        else if (r.match_type === 'starts_with') hit = desc.startsWith(m);
+        else if (r.match_type === 'exact') hit = desc === m;
+        if (hit) { matched = r.category_id; break; }
+      }
+      if (matched && matched !== tx.category_id) {
+        await supabase.from('bank_transactions').update({ category_id: matched }).eq('id', tx.id);
+        updated++;
+      }
+    }
+    toast(`Done. Updated ${updated} transactions.`, { kind: 'success', ms: 4000 });
+    loadAll();
+  } catch (e) {
+    toast('Failed: ' + e.message, { kind: 'error' });
   }
-  toast(`Applied: ${success} success, ${fail} failed.`, { kind: fail ? 'error' : 'success' });
-  onDone && onDone();
 }
 
 // =============================================================================
@@ -689,8 +683,8 @@ function openAccountManager() {
         <tbody>
           ${accts.map(a => `
             <tr>
-              <td><strong>${escapeHtml(a.name)}</strong>${a.institution ? `<div class="muted">${escapeHtml(a.institution)}</div>` : ''}</td>
-              <td><span class="pill ${a.account_type === 'credit' ? 'pill-gold' : 'pill-gray'}">${(a.account_type || '').toUpperCase()}</span></td>
+              <td>${isCredit(a) ? '💳 ' : '🏦 '}<strong>${escapeHtml(a.name)}</strong>${a.institution ? `<div class="muted">${escapeHtml(a.institution)}</div>` : ''}</td>
+              <td><span class="pill pill-gray">${(a.account_type || '').toUpperCase()}</span></td>
               <td class="mono">${escapeHtml(a.last4 || '')}</td>
               <td>${a.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
               <td class="numeric">${fmtMoney(liveBal(a))}</td>
@@ -740,7 +734,7 @@ function editAccount(record, onDone) {
         <input type="checkbox" id="f-active" ${r.is_active !== false ? 'checked' : ''}>
         <label for="f-active" class="field-label" style="margin:0">Active</label>
       </div>
-      <div class="muted" style="font-size:11px;margin-top:6px">Last 4 is matched against uploaded statements to attach transactions to the right account. For credit cards, choose type "credit".</div>
+      <div class="muted" style="font-size:11px;margin-top:6px">For credit cards, set type to CREDIT — the dashboard flips language to AMOUNT OWED, CHARGES, PAYMENTS. Last 4 is matched against uploaded statements.</div>
     `,
     actions: [
       ...(isNew ? [] : [{ label: 'Delete', kind: 'danger', onClick: async () => {
@@ -772,7 +766,10 @@ function editAccount(record, onDone) {
   });
 }
 
-// CSV import (unchanged from prior)
+// =============================================================================
+// CSV import
+// =============================================================================
+
 function importCSV(bankId, onDone) {
   modal({
     title: 'Import Transactions (CSV)',
