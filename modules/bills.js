@@ -5,6 +5,21 @@ import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, daysPastDue, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const MOD = 'bills';
+
+const COLUMNS = [
+  { key: 'bill_number',    label: 'Bill #',    type: 'string' },
+  { key: 'vendor_name',    label: 'Vendor',    type: 'string', get: r => r._vendor?.name || '' },
+  { key: 'project_number', label: 'Project',   type: 'string', get: r => r._project?.project_number || '' },
+  { key: 'due_date',       label: 'Due',       type: 'date' },
+  { key: 'status',         label: 'Status',    type: 'string' },
+  { key: 'total',          label: 'Total',     type: 'number', numeric: true },
+  { key: 'amount_paid',    label: 'Paid',      type: 'number', numeric: true },
+  { key: 'open',           label: 'Open',      type: 'number', numeric: true, get: r => Number(r.total) - Number(r.amount_paid) },
+  { key: '_actions',       label: '',          sortable: false },
+];
 
 export async function renderBills(outlet) {
   outlet.innerHTML = `
@@ -104,14 +119,13 @@ function renderTable(rows) {
     wrap.innerHTML = `<div class="empty-state"><div class="big">NO BILLS</div></div>`;
     return;
   }
+  const state = getSortState(MOD, { key: 'due_date', dir: 'desc' });
+  const sorted = sortRows(rows, COLUMNS, state);
   wrap.innerHTML = `
     <table class="data">
-      <thead><tr>
-        <th>Bill #</th><th>Vendor</th><th>Project</th><th>Due</th><th>Status</th>
-        <th class="numeric">Total</th><th class="numeric">Paid</th><th class="numeric">Open</th><th></th>
-      </tr></thead>
+      <thead><tr>${headerHTML(COLUMNS, state)}</tr></thead>
       <tbody>
-        ${rows.map(b => {
+        ${sorted.map(b => {
           const open = Number(b.total) - Number(b.amount_paid);
           const days = b.status === 'void' || b.status === 'paid' ? 0 : daysPastDue(b.due_date);
           return `
@@ -136,6 +150,7 @@ function renderTable(rows) {
       editBill(b, () => loadList());
     };
   });
+  attachSortHandlers(wrap, MOD, () => renderTable(rows));
 }
 
 async function editBill(record, onDone) {
@@ -246,7 +261,6 @@ async function editBill(record, onDone) {
       } },
     ],
   });
-  // Wire line interactions after modal mounts
   setTimeout(() => {
     const body = document.querySelector('#lines-body');
     const recalc = () => {
