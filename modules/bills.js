@@ -1,5 +1,5 @@
 // =============================================================================
-// Bills — AP entry with line items, expense accounts, aging
+// Bills — AP entry with line items, expense accounts, summary band, aging
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, daysPastDue, escapeHtml } from '../lib/format.js';
@@ -32,6 +32,7 @@ export async function renderBills(outlet) {
         <button class="btn-primary" id="new-bill">+ New Bill</button>
       </div>
     </div>
+    <div id="ap-summary" class="summary-grid"></div>
     <div id="ap-aging" class="aging-grid"></div>
     <div class="toolbar">
       <input type="search" id="bill-search" placeholder="Search bills…" class="input" style="max-width:280px">
@@ -66,11 +67,60 @@ async function loadList() {
     window.__billVendors = vendors;
     window.__billProjects = projects;
     window.__billAccounts = accounts;
+    renderSummary(window.__billsAll);
     renderAging(window.__billsAll);
     filterAndRender();
   } catch (e) {
     wrap.innerHTML = `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
   }
+}
+
+// Summary band: BILLED · PAID · OPEN · PAID/PARTIAL counts · OVERDUE
+function renderSummary(bills) {
+  let billed = 0, paid = 0, open = 0, overdue = 0;
+  let paidCt = 0, partialCt = 0, openCt = 0;
+  for (const b of bills) {
+    if (b.status === 'void') continue;
+    const t = Number(b.total) || 0;
+    const p = Number(b.amount_paid) || 0;
+    billed += t;
+    paid += p;
+    open += (t - p);
+    if (b.status === 'paid') paidCt++;
+    else if (b.status === 'partial') partialCt++;
+    else if (b.status === 'open') openCt++;
+    if (b.status !== 'paid' && (t - p) > 0 && daysPastDue(b.due_date) > 0) {
+      overdue += (t - p);
+    }
+  }
+  const paidPct = billed > 0 ? (paid / billed * 100) : 0;
+  document.getElementById('ap-summary').innerHTML = `
+    <div class="summary-cell">
+      <div class="muted">BILLED</div>
+      <div class="big">${fmtMoney(billed)}</div>
+      <div class="muted" style="font-size:11px">${openCt + partialCt + paidCt} bills</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">PAID</div>
+      <div class="big" style="color:var(--green)">${fmtMoney(paid)}</div>
+      <div class="muted" style="font-size:11px">${paidPct.toFixed(1)}% of billed</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">OPEN</div>
+      <div class="big">${fmtMoney(open)}</div>
+      <div class="muted" style="font-size:11px">across ${openCt + partialCt} bills</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">PAID / PARTIAL</div>
+      <div class="big">${paidCt} / ${partialCt}</div>
+      <div class="muted" style="font-size:11px">paid · partially paid</div>
+    </div>
+    <div class="summary-cell">
+      <div class="muted">OVERDUE</div>
+      <div class="big" style="color:var(--red)">${fmtMoney(overdue)}</div>
+      <div class="muted" style="font-size:11px">past due date</div>
+    </div>
+  `;
 }
 
 function renderAging(bills) {
