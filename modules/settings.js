@@ -52,7 +52,6 @@ export async function renderSettings(outlet) {
       </div>
     </div>
 
-    <!-- Transaction Categories card -->
     <div class="card">
       <div class="card-header">
         <div class="section-title">TRANSACTION CATEGORIES</div>
@@ -61,17 +60,18 @@ export async function renderSettings(outlet) {
       <div id="cat-table-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
     </div>
 
-    <!-- Categorization Rules card -->
     <div class="card" style="margin-top:16px">
       <div class="card-header">
         <div class="section-title">AUTO-CATEGORIZATION RULES</div>
-        <div><button class="btn-sm btn-primary" id="new-rule">+ Rule</button></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn-sm btn-secondary" id="generate-rules">⚡ Generate Rules from My Categorizations</button>
+          <button class="btn-sm btn-primary" id="new-rule">+ Rule</button>
+        </div>
       </div>
-      <div class="muted" style="font-size:11px;padding:0 16px 8px">When a bank transaction's description matches a rule, it's automatically assigned to that category. Rules apply on import. To apply to existing transactions, click "Apply Rules to All" on the Bank page.</div>
+      <div class="muted" style="font-size:11px;padding:0 16px 8px">When a bank transaction's description matches a rule, it's automatically assigned to that category. Rules apply on import. To apply to existing transactions, click "Apply Rules to All" on the Bank page. Click "Generate Rules" to auto-create rules based on how you've already categorized transactions.</div>
       <div id="rules-table-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
     </div>
 
-    <!-- Chart of Accounts card -->
     <div class="card" style="margin-top:16px">
       <div class="card-header">
         <div class="section-title">CHART OF ACCOUNTS</div>
@@ -80,7 +80,6 @@ export async function renderSettings(outlet) {
       <div id="coa-table-wrap" class="table-wrap"><div class="empty-state"><div class="big">LOADING</div></div></div>
     </div>
 
-    <!-- Tax Year Locks card -->
     <div class="card" style="margin-top:16px">
       <div class="card-header">
         <div class="section-title">TAX YEAR LOCKS</div>
@@ -91,14 +90,11 @@ export async function renderSettings(outlet) {
   `;
   document.getElementById('new-cat').onclick = () => editCategory(null, () => loadCats());
   document.getElementById('new-rule').onclick = () => editRule(null, () => loadRules());
+  document.getElementById('generate-rules').onclick = () => generateRulesFromHistory();
   document.getElementById('new-acct').onclick = () => editAccount(null, () => loadCOA());
   document.getElementById('new-lock').onclick = () => addLock(() => loadLocks());
   await Promise.all([loadCats(), loadRules(), loadCOA(), loadLocks()]);
 }
-
-// =============================================================================
-// Categories
-// =============================================================================
 
 async function loadCats() {
   try {
@@ -194,10 +190,6 @@ function editCategory(record, onDone) {
   });
 }
 
-// =============================================================================
-// Rules
-// =============================================================================
-
 async function loadRules() {
   try {
     const [rules, cats] = await Promise.all([
@@ -213,7 +205,7 @@ async function loadRules() {
     window.__rulesCats = cats;
     if (!rules.length) {
       document.getElementById('rules-table-wrap').innerHTML =
-        `<div class="empty-state"><div class="muted">No rules yet. Click "+ Rule" to create your first one. Examples: "Shell" → Gas & Fuel, "AMEX Epayment" → Bank Fees, "Aramark" → Office Supplies.</div></div>`;
+        `<div class="empty-state"><div class="muted">No rules yet. Click "+ Rule" to create your first one, or click "⚡ Generate Rules from My Categorizations" to auto-create rules based on transactions you've already categorized.</div></div>`;
       return;
     }
     renderRules();
@@ -314,9 +306,168 @@ function editRule(record, onDone) {
   });
 }
 
-// =============================================================================
-// Chart of Accounts (existing)
-// =============================================================================
+// Extract a likely merchant identifier from a tx description by stripping
+// common credit-card prefixes, store numbers, and trailing descriptors.
+function extractMerchant(desc) {
+  if (!desc) return '';
+  let s = desc.trim();
+  for (let i = 0; i < 5; i++) {
+    const before = s;
+    s = s.replace(/^(AplPay|CNP|TST\*|BT\*|TCKTWEB\*|SQ\*|AME)\s*/i, '').trim();
+    if (s === before) break;
+  }
+  const dashIdx = s.indexOf(' - ');
+  if (dashIdx > 0) s = s.slice(0, dashIdx);
+  s = s.replace(/\s*\([^)]+\)\s*$/g, '').trim();
+  s = s.replace(/\s+#?\d{2,}$/g, '').trim();
+  return s;
+}
+
+async function generateRulesFromHistory() {
+  try {
+    toast('Analyzing your categorized transactions…', { ms: 2500 });
+    const [txs, accts, cats, existingRules] = await Promise.all([
+      q(supabase.from('bank_transactions').select('description, category_id, bank_account_id')),
+      q(supabase.from('bank_accounts').select('id, account_type')),
+      q(supabase.from('transaction_categories').select('id, name, color').eq('is_active', true)),
+      q(supabase.from('categorization_rules').select('match_text, match_type')),
+    ]);
+    const creditAcctIds = new Set(accts.filter(a => a.account_type === 'credit_card' || a.account_type === 'line_of_credit').map(a => a.id));
+    const catMap = new Map(cats.map(c => [c.id, c]));
+    const existingKeys = new Set(existingRules.map(r => `${r.match_type}:${(r.match_text || '').toLowerCase()}`));
+    const merchants = new Map();
+    for (const t of txs) {
+      if (!creditAcctIds.has(t.bank_account_id)) continue;
+      if (!t.category_id) continue;
+      const merchant = extractMerchant(t.description);
+      if (!merchant || merchant.length < 3) continue;
+      const key = merchant.toLowerCase();
+      if (!merchants.has(key)) {
+        merchants.set(key, { merchant, byCat: new Map(), totalCount: 0 });
+      }
+      const m = merchants.get(key);
+      m.byCat.set(t.category_id, (m.byCat.get(t.category_id) || 0) + 1);
+      m.totalCount++;
+    }
+    const proposals = [];
+    for (const [key, m] of merchants) {
+      if (existingKeys.has(`contains:${key}`)) continue;
+      let topCatId = null, topCount = 0;
+      for (const [catId, count] of m.byCat) {
+        if (count > topCount) { topCatId = catId; topCount = count; }
+      }
+      const confidence = topCount / m.totalCount;
+      const cat = catMap.get(topCatId);
+      if (!cat) continue;
+      proposals.push({
+        match_text: m.merchant,
+        category_id: topCatId,
+        category_name: cat.name,
+        category_color: cat.color,
+        count: m.totalCount,
+        confidence,
+        ambiguous: confidence < 1,
+      });
+    }
+    proposals.sort((a, b) => {
+      if (a.category_name !== b.category_name) return a.category_name.localeCompare(b.category_name);
+      return b.count - a.count;
+    });
+    if (!proposals.length) {
+      toast('No new patterns found. Either you have no categorized credit-card tx or rules already exist for them.', { kind: 'error', ms: 5000 });
+      return;
+    }
+    showRulePreviewModal(proposals);
+  } catch (e) {
+    toast('Failed: ' + e.message, { kind: 'error' });
+  }
+}
+
+function showRulePreviewModal(proposals) {
+  const byCat = new Map();
+  for (const p of proposals) {
+    if (!byCat.has(p.category_name)) byCat.set(p.category_name, { color: p.category_color, items: [] });
+    byCat.get(p.category_name).items.push(p);
+  }
+  let bodyHTML = `
+    <div class="muted" style="font-size:11px;margin-bottom:10px">
+      Found <strong>${proposals.length}</strong> merchant patterns across your categorized transactions.
+      Uncheck any you don't want to turn into rules. Each rule will match the description "contains" the text shown.
+    </div>
+    <div style="max-height:60vh;overflow-y:auto;border:1px solid var(--hairline);border-radius:6px;padding:10px;background:var(--ink-50)">
+  `;
+  for (const [catName, group] of byCat) {
+    bodyHTML += `
+      <div style="margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:8px;font-weight:600;font-size:13px;margin-bottom:6px">
+          <span style="display:inline-block;width:10px;height:10px;background:${group.color || '#888'};border-radius:2px"></span>
+          ${escapeHtml(catName)}
+          <span class="muted" style="font-weight:400;font-size:11px">(${group.items.length} ${group.items.length === 1 ? 'rule' : 'rules'})</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px">
+    `;
+    for (const p of group.items) {
+      const ambiguousNote = p.ambiguous
+        ? ` <span class="muted" style="color:var(--amber);font-size:11px">(${(p.confidence * 100).toFixed(0)}% — sometimes other categories)</span>`
+        : '';
+      bodyHTML += `
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;padding:4px 6px;background:white;border-radius:4px;cursor:pointer">
+          <input type="checkbox" class="rule-prop" data-text="${escapeHtml(p.match_text)}" data-cat="${p.category_id}" ${p.ambiguous ? '' : 'checked'}>
+          <span class="mono" style="flex:1">"${escapeHtml(p.match_text)}"</span>
+          <span class="muted" style="font-size:11px">×${p.count}</span>${ambiguousNote}
+        </label>
+      `;
+    }
+    bodyHTML += `</div></div>`;
+  }
+  bodyHTML += `</div>`;
+  bodyHTML += `
+    <div class="muted" style="font-size:11px;margin-top:8px">
+      💡 Items marked in amber are merchants you've categorized inconsistently — review carefully.
+      All others (100% match) are pre-checked.
+    </div>
+  `;
+
+  modal({
+    title: 'Generate Categorization Rules',
+    bodyHTML,
+    actions: [
+      { label: 'Cancel', kind: 'secondary' },
+      { label: 'Toggle All', kind: 'secondary', onClick: (bg) => {
+        const cbs = bg.querySelectorAll('.rule-prop');
+        const allChecked = [...cbs].every(c => c.checked);
+        cbs.forEach(c => c.checked = !allChecked);
+        return false;
+      } },
+      { label: 'Create Rules', kind: 'primary', onClick: async (bg) => {
+        const checked = [...bg.querySelectorAll('.rule-prop:checked')];
+        if (!checked.length) { toast('Nothing selected', { kind: 'error' }); return false; }
+        toast(`Creating ${checked.length} rules…`, { ms: 2000 });
+        const inserts = checked.map(cb => ({
+          match_text: cb.dataset.text,
+          match_type: 'contains',
+          category_id: cb.dataset.cat,
+          priority: 100,
+          is_active: true,
+        }));
+        try {
+          let created = 0;
+          for (let i = 0; i < inserts.length; i += 50) {
+            const chunk = inserts.slice(i, i + 50);
+            await q(supabase.from('categorization_rules').insert(chunk));
+            created += chunk.length;
+          }
+          toast(`Created ${created} rules. Click "Apply Rules to All" on the Bank page to apply them retroactively.`, { kind: 'success', ms: 5000 });
+          loadRules();
+          loadCats();
+        } catch (e) {
+          toast('Failed: ' + e.message, { kind: 'error' });
+          return false;
+        }
+      } },
+    ],
+  });
+}
 
 async function loadCOA() {
   try {
@@ -404,10 +555,6 @@ function editAccount(record, onDone) {
     ],
   });
 }
-
-// =============================================================================
-// Tax Year Locks (existing)
-// =============================================================================
 
 async function loadLocks() {
   try {
