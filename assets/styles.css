@@ -960,3 +960,32 @@ table.data .mono { font-family: var(--font-mono); font-size: 12px; }
   from { transform: translateY(20px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
 }
+
+
+/* =============================================================================
+   ADDITIONS for sortable table headers
+   ============================================================================= */
+.sortable-th {
+  cursor: pointer;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.sortable-th:hover { color: var(--ink-900); }
+.sort-arrow {
+  font-size: 10px;
+  opacity: 0.35;
+  display: inline-block;
+  width: 10px;
+  text-align: center;
+  font-weight: bold;
+}
+.sort-arrow.active {
+  opacity: 1;
+  color: var(--gold);
+}
+table.data thead th[data-sort-key]:hover,
+table.data thead th .sortable-th:hover {
+  color: var(--ink-900);
+}
