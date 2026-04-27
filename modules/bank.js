@@ -1,12 +1,5 @@
 // =============================================================================
 // Bank — Per-account dashboard with KPIs, charts, and full tx explorer
-// -----------------------------------------------------------------------------
-// Layout (per selected account):
-//   1. Account picker + meta (last4, type, period covered)
-//   2. KPI band: Current Balance · This Month Deposits · This Month Withdrawals · Net
-//   3. Running-balance line chart (full history)
-//   4. Monthly deposits-vs-withdrawals bar chart (last 12 months)
-//   5. Filterable, sortable transaction table with date range + statement batch trace
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, escapeHtml } from '../lib/format.js';
@@ -71,36 +64,48 @@ function renderDashboard() {
   const acct = accts.find(a => a.id === acctId);
   const txs = allTx.filter(t => t.bank_account_id === acctId);
 
-  // Compute the live current balance: most recent transaction's balance_after.
-  // If none, fall back to acct.current_balance.
-  const sortedDesc = [...txs].sort((a, b) => b.date.localeCompare(a.date) || (b.created_at || '').localeCompare(a.created_at || ''));
-  const liveBalance = sortedDesc.length && sortedDesc[0].balance_after != null
-    ? Number(sortedDesc[0].balance_after)
+  // Sort descending. For liveBalance, prefer the most recent tx that HAS a
+  // balance_after value (some statement extractions only populate balance_after
+  // on summary rows like "End of period balance", not every individual tx).
+  const sortedDesc = [...txs].sort((a, b) =>
+    b.date.localeCompare(a.date) || (b.created_at || '').localeCompare(a.created_at || '')
+  );
+  const latestWithBalance = sortedDesc.find(t => t.balance_after != null);
+  const liveBalance = latestWithBalance
+    ? Number(latestWithBalance.balance_after)
     : Number(acct?.current_balance || 0);
+  const balanceAsOfDate = latestWithBalance ? latestWithBalance.date : (sortedDesc[0]?.date || null);
 
-  // This month aggregates
-  const now = new Date();
-  const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+  // "Latest period" aggregates: use the most recent month that has tx, not the
+  // calendar-current month. For monthly statements this matches what the user
+  // actually uploaded and wants to see.
   let mDeposits = 0, mWithdrawals = 0;
-  for (const t of txs) {
-    if (t.date < monthStart) continue;
-    const a = Number(t.amount);
-    if (a > 0) mDeposits += a;
-    else mWithdrawals += a;
+  let latestPeriodLabel = '';
+  let latestPeriodKey = '';
+  if (sortedDesc.length) {
+    latestPeriodKey = sortedDesc[0].date.slice(0, 7); // YYYY-MM
+    const periodStart = latestPeriodKey + '-01';
+    const periodEnd = latestPeriodKey + '-31';
+    for (const t of txs) {
+      if (t.date < periodStart || t.date > periodEnd) continue;
+      const a = Number(t.amount);
+      if (a > 0) mDeposits += a;
+      else mWithdrawals += a;
+    }
+    const d = new Date(periodStart + 'T00:00:00');
+    latestPeriodLabel = d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   }
   const mNet = mDeposits + mWithdrawals;
 
-  // If we have any tx, find period of the most recent statement batch
+  // Most recent statement batch (for the meta-strip)
   const lastBatchId = sortedDesc.length ? sortedDesc[0].import_batch_id : null;
   const lastBatchTx = lastBatchId ? txs.filter(t => t.import_batch_id === lastBatchId) : [];
   const batchStart = lastBatchTx.length ? lastBatchTx.reduce((m, t) => t.date < m ? t.date : m, lastBatchTx[0].date) : null;
   const batchEnd = lastBatchTx.length ? lastBatchTx.reduce((m, t) => t.date > m ? t.date : m, lastBatchTx[0].date) : null;
 
-  // Active statement window (default to current month, but track via window state)
   const acctOpts = accts.map(a => `<option value="${a.id}" ${a.id === acctId ? 'selected' : ''}>${escapeHtml(a.name)} ····${a.last4 || '—'}</option>`).join('');
 
   document.getElementById('bank-area').innerHTML = `
-    <!-- Account picker -->
     <div class="card" style="margin-bottom:14px">
       <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
         <div>
@@ -126,27 +131,26 @@ function renderDashboard() {
       </div>
     </div>
 
-    <!-- KPI band -->
     <div class="summary-grid" style="margin-bottom:14px">
       <div class="summary-cell">
         <div class="muted">CURRENT BALANCE</div>
         <div class="big">${fmtMoney(liveBalance)}</div>
-        <div class="muted" style="font-size:11px">${sortedDesc.length ? `as of ${fmtDate(sortedDesc[0].date)}` : 'no transactions yet'}</div>
+        <div class="muted" style="font-size:11px">${balanceAsOfDate ? `as of ${fmtDate(balanceAsOfDate)}` : 'no transactions yet'}</div>
       </div>
       <div class="summary-cell">
-        <div class="muted">THIS MONTH DEPOSITS</div>
+        <div class="muted">DEPOSITS</div>
         <div class="big" style="color:var(--green)">${fmtMoney(mDeposits)}</div>
-        <div class="muted" style="font-size:11px">since ${fmtDate(monthStart)}</div>
+        <div class="muted" style="font-size:11px">${latestPeriodLabel || 'no data'}</div>
       </div>
       <div class="summary-cell">
-        <div class="muted">THIS MONTH WITHDRAWALS</div>
+        <div class="muted">WITHDRAWALS</div>
         <div class="big" style="color:var(--red)">${fmtMoney(Math.abs(mWithdrawals))}</div>
-        <div class="muted" style="font-size:11px">since ${fmtDate(monthStart)}</div>
+        <div class="muted" style="font-size:11px">${latestPeriodLabel || 'no data'}</div>
       </div>
       <div class="summary-cell">
         <div class="muted">NET CHANGE</div>
         <div class="big" style="color:${mNet >= 0 ? 'var(--green)' : 'var(--red)'}">${mNet >= 0 ? '+' : ''}${fmtMoney(mNet)}</div>
-        <div class="muted" style="font-size:11px">this month</div>
+        <div class="muted" style="font-size:11px">${latestPeriodLabel ? `for ${latestPeriodLabel}` : 'no data'}</div>
       </div>
       <div class="summary-cell">
         <div class="muted">TRANSACTIONS</div>
@@ -155,7 +159,6 @@ function renderDashboard() {
       </div>
     </div>
 
-    <!-- Charts row -->
     <div class="card" style="margin-bottom:14px">
       <div class="card-header">
         <div class="section-title">RUNNING BALANCE</div>
@@ -172,7 +175,6 @@ function renderDashboard() {
       <div id="month-chart"></div>
     </div>
 
-    <!-- Transaction explorer -->
     <div class="card">
       <div class="card-header">
         <div class="section-title">TRANSACTIONS</div>
@@ -199,18 +201,15 @@ function renderDashboard() {
     </div>
   `;
 
-  // Wire up account picker
   document.getElementById('acct-picker').onchange = (e) => {
     window.__selectedAcctId = e.target.value;
     renderDashboard();
   };
   document.getElementById('import-csv-btn').onclick = () => importCSV(acctId, () => loadAll());
 
-  // Render charts (SVG)
   drawBalanceChart(txs);
   drawMonthChart(txs);
 
-  // Render filterable tx table
   document.getElementById('tx-search').oninput = renderTxTable;
   document.getElementById('tx-from').onchange = renderTxTable;
   document.getElementById('tx-to').onchange = renderTxTable;
@@ -250,7 +249,6 @@ function renderTxTable() {
     return;
   }
 
-  // Footer totals based on filtered rows
   const totals = txs.reduce((acc, t) => {
     const a = Number(t.amount);
     if (a > 0) acc.deposits += a;
@@ -293,20 +291,18 @@ function renderTxTable() {
 }
 
 // =============================================================================
-// SVG charts (no library deps)
+// SVG charts
 // =============================================================================
 
 function drawBalanceChart(txs) {
   const wrap = document.getElementById('balance-chart');
   const points = txs.filter(t => t.balance_after != null).map(t => ({
-    date: t.date,
-    balance: Number(t.balance_after),
+    date: t.date, balance: Number(t.balance_after),
   }));
   if (!points.length) {
     wrap.innerHTML = `<div class="empty-state"><div class="muted">No data yet — upload a statement to see the running balance.</div></div>`;
     return;
   }
-  // De-dupe by date (keep last entry per day)
   const byDate = new Map();
   for (const p of points) byDate.set(p.date, p);
   const series = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
@@ -314,47 +310,32 @@ function drawBalanceChart(txs) {
   const W = 900, H = 220, M = { l: 60, r: 20, t: 10, b: 30 };
   const innerW = W - M.l - M.r;
   const innerH = H - M.t - M.b;
-
   const minB = Math.min(...series.map(p => p.balance), 0);
   const maxB = Math.max(...series.map(p => p.balance));
   const padB = (maxB - minB) * 0.1 || 100;
   const yMin = minB - padB, yMax = maxB + padB;
   const range = (yMax - yMin) || 1;
-
   const x = (i) => M.l + (innerW * i / Math.max(1, series.length - 1));
   const y = (v) => M.t + innerH * (1 - (v - yMin) / range);
-
   const path = series.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.balance).toFixed(1)}`).join(' ');
   const fillPath = path + ` L${x(series.length - 1).toFixed(1)},${(M.t + innerH).toFixed(1)} L${x(0).toFixed(1)},${(M.t + innerH).toFixed(1)} Z`;
-
-  // Y-axis labels at 4 levels
   const yTicks = 4;
   const yLabels = Array.from({ length: yTicks + 1 }, (_, i) => {
     const v = yMin + (range * i / yTicks);
     return { v, ypx: y(v) };
   });
-
-  // X-axis labels: first, ~3 middles, last
   const xTickIdxs = series.length <= 5
     ? series.map((_, i) => i)
     : [0, Math.floor(series.length * 0.25), Math.floor(series.length * 0.5), Math.floor(series.length * 0.75), series.length - 1];
-
-  // Hover dots (last 12)
   const dotIdxs = series.length <= 30 ? series.map((_, i) => i) : Array.from({length: 30}, (_, k) => Math.floor(k * (series.length - 1) / 29));
 
   wrap.innerHTML = `
     <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;font-family:inherit">
-      <!-- gridlines -->
       ${yLabels.map(t => `<line x1="${M.l}" y1="${t.ypx}" x2="${M.l + innerW}" y2="${t.ypx}" stroke="var(--hairline)" stroke-width="1"/>`).join('')}
-      <!-- area fill -->
       <path d="${fillPath}" fill="var(--gold-soft)" opacity="0.4"/>
-      <!-- line -->
       <path d="${path}" fill="none" stroke="var(--gold)" stroke-width="2"/>
-      <!-- dots -->
       ${dotIdxs.map(i => `<circle cx="${x(i).toFixed(1)}" cy="${y(series[i].balance).toFixed(1)}" r="3" fill="var(--gold)"><title>${series[i].date}: $${series[i].balance.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title></circle>`).join('')}
-      <!-- y labels -->
       ${yLabels.map(t => `<text x="${M.l - 8}" y="${t.ypx + 4}" text-anchor="end" font-size="10" fill="var(--ink-500)">$${Math.round(t.v).toLocaleString()}</text>`).join('')}
-      <!-- x labels -->
       ${xTickIdxs.map(i => `<text x="${x(i).toFixed(1)}" y="${H - 10}" text-anchor="middle" font-size="10" fill="var(--ink-500)">${shortDate(series[i].date)}</text>`).join('')}
     </svg>
   `;
@@ -366,7 +347,6 @@ function drawMonthChart(txs) {
     wrap.innerHTML = `<div class="empty-state"><div class="muted">No data yet.</div></div>`;
     return;
   }
-  // Aggregate by YYYY-MM
   const byMonth = new Map();
   for (const t of txs) {
     const m = t.date.slice(0, 7);
@@ -376,17 +356,14 @@ function drawMonthChart(txs) {
     if (a > 0) cell.deposits += a;
     else cell.withdrawals += a;
   }
-  // Sort and keep last 12 months
   const months = [...byMonth.entries()].sort((a, b) => a[0].localeCompare(b[0])).slice(-12);
   if (!months.length) {
     wrap.innerHTML = `<div class="empty-state"><div class="muted">No data yet.</div></div>`;
     return;
   }
-
   const W = 900, H = 240, M = { l: 60, r: 20, t: 10, b: 40 };
   const innerW = W - M.l - M.r;
   const innerH = H - M.t - M.b;
-
   const maxAbs = Math.max(...months.map(([_, v]) => Math.max(v.deposits, Math.abs(v.withdrawals))), 100);
   const yMax = maxAbs * 1.1;
   const yMin = -yMax;
@@ -394,14 +371,11 @@ function drawMonthChart(txs) {
   const zeroY = M.t + innerH * (yMax / range);
   const groupW = innerW / months.length;
   const barW = Math.min(groupW * 0.35, 24);
-
   const y = (v) => M.t + innerH * (1 - (v - yMin) / range);
 
   wrap.innerHTML = `
     <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;font-family:inherit">
-      <!-- zero line -->
       <line x1="${M.l}" y1="${zeroY}" x2="${M.l + innerW}" y2="${zeroY}" stroke="var(--hairline-dark)" stroke-width="1"/>
-      <!-- y gridlines (max + min) -->
       <line x1="${M.l}" y1="${M.t}" x2="${M.l + innerW}" y2="${M.t}" stroke="var(--hairline)" stroke-width="1"/>
       <line x1="${M.l}" y1="${M.t + innerH}" x2="${M.l + innerW}" y2="${M.t + innerH}" stroke="var(--hairline)" stroke-width="1"/>
       <text x="${M.l - 8}" y="${M.t + 4}" text-anchor="end" font-size="10" fill="var(--ink-500)">+$${Math.round(yMax).toLocaleString()}</text>
@@ -411,15 +385,11 @@ function drawMonthChart(txs) {
         const cx = M.l + groupW * i + groupW / 2;
         const depTop = y(v.deposits);
         const depHeight = Math.abs(zeroY - depTop);
-        const wTop = zeroY;
         const wHeight = Math.abs(y(v.withdrawals) - zeroY);
-        const wActualTop = y(v.withdrawals);
         return `
-          <!-- deposit bar (above zero) -->
           <rect x="${cx - barW - 1}" y="${depTop}" width="${barW}" height="${depHeight}" fill="var(--green)" opacity="0.85">
             <title>${m} deposits: $${v.deposits.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title>
           </rect>
-          <!-- withdrawal bar (below zero) -->
           <rect x="${cx + 1}" y="${zeroY}" width="${barW}" height="${wHeight}" fill="var(--red)" opacity="0.85">
             <title>${m} withdrawals: $${Math.abs(v.withdrawals).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2})}</title>
           </rect>
@@ -427,7 +397,6 @@ function drawMonthChart(txs) {
           <text x="${cx}" y="${H - 6}" text-anchor="middle" font-size="9" fill="${(v.deposits + v.withdrawals) >= 0 ? 'var(--green)' : 'var(--red)'}" font-weight="600">${(v.deposits + v.withdrawals) >= 0 ? '+' : ''}$${Math.round(v.deposits + v.withdrawals).toLocaleString()}</text>
         `;
       }).join('')}
-      <!-- legend -->
       <g transform="translate(${M.l + 8}, ${M.t + 12})">
         <rect width="10" height="10" fill="var(--green)" opacity="0.85"/>
         <text x="14" y="9" font-size="10" fill="var(--ink-700)">Deposits</text>
@@ -439,20 +408,18 @@ function drawMonthChart(txs) {
 }
 
 function shortDate(iso) {
-  // "2026-01-15" → "Jan 15"
   const d = new Date(iso + 'T00:00:00');
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
 function monthLabel(ym) {
-  // "2026-01" → "Jan '26"
   const [y, m] = ym.split('-');
   const d = new Date(Number(y), Number(m) - 1, 1);
-  return d.toLocaleDateString('en-US', { month: 'short' }) + ' \'' + y.slice(2);
+  return d.toLocaleDateString('en-US', { month: 'short' }) + " '" + y.slice(2);
 }
 
 // =============================================================================
-// Account manager (replaces the old account-list page)
+// Account manager
 // =============================================================================
 
 function openAccountManager() {
@@ -463,13 +430,12 @@ function openAccountManager() {
     if (!txByAcct.has(t.bank_account_id)) txByAcct.set(t.bank_account_id, []);
     txByAcct.get(t.bank_account_id).push(t);
   }
-
   const liveBal = (a) => {
     const list = txByAcct.get(a.id) || [];
     if (!list.length) return Number(a.current_balance || 0);
-    const latest = list.reduce((m, t) =>
-      (t.date > m.date || (t.date === m.date && (t.created_at || '') > (m.created_at || ''))) ? t : m, list[0]);
-    return latest.balance_after != null ? Number(latest.balance_after) : Number(a.current_balance || 0);
+    const sorted = [...list].sort((x, y) => y.date.localeCompare(x.date) || (y.created_at || '').localeCompare(x.created_at || ''));
+    const withBal = sorted.find(t => t.balance_after != null);
+    return withBal ? Number(withBal.balance_after) : Number(a.current_balance || 0);
   };
 
   modal({
@@ -499,7 +465,6 @@ function openAccountManager() {
   });
   setTimeout(() => {
     document.querySelector('#add-new-acct')?.addEventListener('click', () => {
-      // Close current modal first
       document.querySelector('.modal-backdrop')?.remove();
       editAccount(null, () => loadAll());
     });
@@ -568,17 +533,12 @@ function editAccount(record, onDone) {
   });
 }
 
-// =============================================================================
-// CSV import (kept from prior version — same parser, just wired to new entry)
-// =============================================================================
-
 function importCSV(bankId, onDone) {
   modal({
     title: 'Import Transactions (CSV)',
     bodyHTML: `
       <p class="muted">Paste CSV (Chase or Capital One format auto-detected). Required columns: Date, Description, Amount.</p>
       <div class="field"><textarea class="input mono" id="f-csv" rows="10" style="font-size:11px" placeholder="Date,Description,Amount,Balance"></textarea></div>
-      <div id="parse-status" class="muted" style="margin-top:8px"></div>
     `,
     actions: [
       { label: 'Cancel', kind: 'secondary' },
@@ -634,9 +594,7 @@ function parseCSV(text) {
 }
 
 function parseRow(line) {
-  const out = [];
-  let cur = '';
-  let inq = false;
+  const out = []; let cur = ''; let inq = false;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (c === '"') { inq = !inq; continue; }
