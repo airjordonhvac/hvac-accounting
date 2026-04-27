@@ -75,7 +75,6 @@ async function loadList() {
   }
 }
 
-// Summary band: BILLED · PAID · OPEN · PAID/PARTIAL counts · OVERDUE
 function renderSummary(bills) {
   let billed = 0, paid = 0, open = 0, overdue = 0;
   let paidCt = 0, partialCt = 0, openCt = 0;
@@ -227,6 +226,7 @@ async function editBill(record, onDone) {
       <td><select class="select" data-f="expense_account_id">${acctOpts(l.expense_account_id)}</select></td>
       <td><button class="btn-sm btn-ghost rm-line" type="button">×</button></td>
     </tr>`;
+  const showPayBlock = (r.status === 'partial' || r.status === 'paid');
   modal({
     title: isNew ? 'New Bill' : `Edit Bill ${r.bill_number || ''}`,
     bodyHTML: `
@@ -256,7 +256,19 @@ async function editBill(record, onDone) {
         <div class="field"><label class="field-label">Tax</label><input class="input numeric" id="f-tax" type="number" step="0.01" value="${r.tax || 0}"></div>
         <div class="field"><label class="field-label">Total</label><input class="input numeric" id="f-total" type="number" step="0.01" value="${r.total || 0}" readonly></div>
       </div>
-      <div class="field"><label class="field-label">Notes</label><textarea class="input" id="f-notes" rows="2">${escapeHtml(r.notes || '')}</textarea></div>
+      <div id="pay-block" style="border-top:1px solid var(--hairline); margin-top:14px; padding-top:14px; ${showPayBlock ? '' : 'display:none;'}">
+        <div class="section-title" style="margin-bottom:10px">PAYMENT SENT</div>
+        <div class="field-row-3">
+          <div class="field"><label class="field-label">Paid Amount</label><input class="input numeric" id="f-paid" type="number" step="0.01" value="${r.amount_paid || 0}"></div>
+          <div class="field"><label class="field-label">Open Balance</label><input class="input numeric" id="f-open" type="number" readonly value="${(Number(r.total) - Number(r.amount_paid)).toFixed(2)}"></div>
+          <div class="field"><label class="field-label">% Paid</label><input class="input numeric" id="f-pct" type="text" readonly value="${(Number(r.total) > 0 ? (Number(r.amount_paid) / Number(r.total) * 100) : 0).toFixed(1)}%"></div>
+        </div>
+        <div class="muted" style="font-size:11px;margin-top:6px">
+          Type the amount actually paid against this bill. Status auto-adjusts:
+          0 = OPEN · partial = PARTIAL · full = PAID.
+        </div>
+      </div>
+      <div class="field" style="margin-top:14px"><label class="field-label">Notes</label><textarea class="input" id="f-notes" rows="2">${escapeHtml(r.notes || '')}</textarea></div>
     `,
     actions: [
       ...(isNew ? [] : [{ label: 'Void', kind: 'danger', onClick: async (bg) => {
@@ -281,14 +293,35 @@ async function editBill(record, onDone) {
         const subtotal = Number(bg.querySelector('#f-sub').value || 0);
         const tax = Number(bg.querySelector('#f-tax').value || 0);
         const total = Number(bg.querySelector('#f-total').value || 0);
+
+        let status = bg.querySelector('#f-status').value;
+        let amount_paid = 0;
+        const payInput = bg.querySelector('#f-paid');
+        const typed = payInput ? Number(payInput.value || 0) : 0;
+        if (status === 'paid') {
+          amount_paid = total;
+        } else if (status === 'partial') {
+          if (typed <= 0) { toast('Partial status requires a Paid Amount > 0', { kind: 'error' }); return false; }
+          if (typed >= total) {
+            status = 'paid';
+            amount_paid = total;
+          } else {
+            amount_paid = typed;
+          }
+        } else if (status === 'open') {
+          amount_paid = 0;
+        } else {
+          amount_paid = typed;
+        }
+
         const data = {
           bill_number: bg.querySelector('#f-num').value.trim() || null,
           vendor_id: bg.querySelector('#f-ven').value || null,
           project_id: bg.querySelector('#f-proj').value || null,
           bill_date: bg.querySelector('#f-date').value,
           due_date: bg.querySelector('#f-due').value,
-          status: bg.querySelector('#f-status').value,
-          subtotal, tax, total,
+          status,
+          subtotal, tax, total, amount_paid,
           notes: bg.querySelector('#f-notes').value.trim() || null,
         };
         if (!data.vendor_id) { toast('Vendor is required', { kind: 'error' }); return false; }
@@ -296,7 +329,7 @@ async function editBill(record, onDone) {
         try {
           let billId = r.id;
           if (isNew) {
-            const ins = await q(supabase.from('bills').insert({ ...data, amount_paid: 0 }).select().single());
+            const ins = await q(supabase.from('bills').insert(data).select().single());
             billId = ins.id;
           } else {
             await q(supabase.from('bills').update(data).eq('id', r.id));
@@ -311,9 +344,21 @@ async function editBill(record, onDone) {
       } },
     ],
   });
+
   setTimeout(() => {
-    const body = document.querySelector('#lines-body');
-    const recalc = () => {
+    const modalEl = document.querySelector('.modal');
+    if (!modalEl) return;
+    const body = modalEl.querySelector('#lines-body');
+    const totalEl = modalEl.querySelector('#f-total');
+    const subEl = modalEl.querySelector('#f-sub');
+    const taxEl = modalEl.querySelector('#f-tax');
+    const statusEl = modalEl.querySelector('#f-status');
+    const payBlock = modalEl.querySelector('#pay-block');
+    const paidEl = modalEl.querySelector('#f-paid');
+    const openEl = modalEl.querySelector('#f-open');
+    const pctEl = modalEl.querySelector('#f-pct');
+
+    const recalcLines = () => {
       let sub = 0;
       body.querySelectorAll('.line-row').forEach(row => {
         const qty = Number(row.querySelector('[data-f=quantity]').value) || 0;
@@ -322,22 +367,47 @@ async function editBill(record, onDone) {
         if (document.activeElement !== amtIn) amtIn.value = (qty * rate).toFixed(2);
         sub += Number(amtIn.value) || 0;
       });
-      document.querySelector('#f-sub').value = sub.toFixed(2);
-      const tax = Number(document.querySelector('#f-tax').value) || 0;
-      document.querySelector('#f-total').value = (sub + tax).toFixed(2);
+      subEl.value = sub.toFixed(2);
+      const tax = Number(taxEl.value) || 0;
+      totalEl.value = (sub + tax).toFixed(2);
+      recalcPayment();
     };
-    body.addEventListener('input', recalc);
-    document.querySelector('#f-tax').addEventListener('input', recalc);
+
+    const recalcPayment = () => {
+      if (!payBlock || payBlock.style.display === 'none') return;
+      const total = Number(totalEl.value) || 0;
+      const paid = Number(paidEl.value) || 0;
+      openEl.value = (total - paid).toFixed(2);
+      pctEl.value = (total > 0 ? (paid / total * 100) : 0).toFixed(1) + '%';
+    };
+
+    const togglePayBlockForStatus = (newStatus) => {
+      if (newStatus === 'partial' || newStatus === 'paid') {
+        payBlock.style.display = '';
+        if (newStatus === 'paid') {
+          paidEl.value = (Number(totalEl.value) || 0).toFixed(2);
+        }
+        recalcPayment();
+      } else {
+        payBlock.style.display = 'none';
+      }
+    };
+
+    body.addEventListener('input', recalcLines);
+    taxEl.addEventListener('input', recalcLines);
+    if (paidEl) paidEl.addEventListener('input', recalcPayment);
+    statusEl.addEventListener('change', () => togglePayBlockForStatus(statusEl.value));
+
     body.addEventListener('click', (e) => {
-      if (e.target.matches('.rm-line')) { e.target.closest('.line-row').remove(); recalc(); }
+      if (e.target.matches('.rm-line')) { e.target.closest('.line-row').remove(); recalcLines(); }
     });
-    document.querySelector('#add-line').addEventListener('click', () => {
+    modalEl.querySelector('#add-line').addEventListener('click', () => {
       const idx = body.querySelectorAll('.line-row').length;
       const tmp = document.createElement('tbody');
       tmp.innerHTML = lineHTML({ description: '', quantity: 1, rate: 0, amount: 0, expense_account_id: null }, idx);
       body.appendChild(tmp.querySelector('tr'));
-      recalc();
+      recalcLines();
     });
-    recalc();
+    recalcLines();
   }, 50);
 }
