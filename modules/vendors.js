@@ -5,6 +5,45 @@ import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const MOD = 'vendors';
+
+// Returns { state: 'ok' | 'expiring' | 'expired' | 'missing', daysLeft: number | null }
+function coiStatus(v) {
+  if (!v.coi_url) return { state: 'missing', daysLeft: null };
+  if (!v.coi_expiry_date) return { state: 'ok', daysLeft: null };
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const exp = new Date(v.coi_expiry_date);
+  exp.setHours(0,0,0,0);
+  const days = Math.round((exp - today) / 86400000);
+  if (days < 0) return { state: 'expired', daysLeft: days };
+  if (days <= 30) return { state: 'expiring', daysLeft: days };
+  return { state: 'ok', daysLeft: days };
+}
+
+// COI sort weight: missing < expired < expiring < ok (but on natural-sort think:
+// urgent items should appear first in 'asc'. Let's use numbers: 0 = most urgent)
+function coiSortKey(v) {
+  const s = coiStatus(v);
+  if (s.state === 'missing') return 0;
+  if (s.state === 'expired') return 1;
+  if (s.state === 'expiring') return 2;
+  return 3;
+}
+
+const COLUMNS = [
+  { key: 'name',           label: 'Name',     type: 'string' },
+  { key: 'contact',        label: 'Contact',  type: 'string' },
+  { key: 'email',          label: 'Email',    type: 'string' },
+  { key: 'phone',          label: 'Phone',    type: 'string' },
+  { key: 'is_1099',        label: '1099',     type: 'number', get: r => r.is_1099 ? 1 : 0 },
+  { key: 'w9_url',         label: 'W-9',      type: 'number', get: r => r.w9_url ? 1 : 0 },
+  { key: 'coi_status',     label: 'COI',      type: 'number', get: r => coiSortKey(r) },
+  { key: '_ap',            label: 'Open AP',  type: 'number', numeric: true },
+  { key: '_actions',       label: '',         sortable: false },
+];
 
 export async function renderVendors(outlet) {
   outlet.innerHTML = `
@@ -55,20 +94,6 @@ async function loadList() {
   }
 }
 
-// Returns { state: 'ok' | 'expiring' | 'expired' | 'missing', daysLeft: number | null }
-function coiStatus(v) {
-  if (!v.coi_url) return { state: 'missing', daysLeft: null };
-  if (!v.coi_expiry_date) return { state: 'ok', daysLeft: null };
-  const today = new Date();
-  today.setHours(0,0,0,0);
-  const exp = new Date(v.coi_expiry_date);
-  exp.setHours(0,0,0,0);
-  const days = Math.round((exp - today) / 86400000);
-  if (days < 0) return { state: 'expired', daysLeft: days };
-  if (days <= 30) return { state: 'expiring', daysLeft: days };
-  return { state: 'ok', daysLeft: days };
-}
-
 function coiPill(v) {
   const s = coiStatus(v);
   if (s.state === 'missing') return '<span class="pill" style="background:rgba(226,92,92,.18);color:var(--red)">NONE</span>';
@@ -103,22 +128,18 @@ function renderTable(rows) {
     wrap.innerHTML = `<div class="empty-state"><div class="big">NO VENDORS</div><div>Click "New Vendor" to add one.</div></div>`;
     return;
   }
+  const state = getSortState(MOD, { key: 'name', dir: 'asc' });
+  const sorted = sortRows(rows, COLUMNS, state);
   wrap.innerHTML = `
     <table class="data">
-      <thead><tr>
-        <th>Name</th><th>Contact</th><th>Email / Phone</th>
-        <th>1099</th><th>W-9</th><th>COI</th>
-        <th class="numeric">Open AP</th><th></th>
-      </tr></thead>
+      <thead><tr>${headerHTML(COLUMNS, state)}</tr></thead>
       <tbody>
-        ${rows.map(v => `
+        ${sorted.map(v => `
           <tr>
             <td><strong>${escapeHtml(v.name)}</strong></td>
             <td>${escapeHtml(v.contact || '')}</td>
-            <td>
-              ${v.email ? `<div>${escapeHtml(v.email)}</div>` : ''}
-              ${v.phone ? `<div class="muted">${escapeHtml(v.phone)}</div>` : ''}
-            </td>
+            <td>${escapeHtml(v.email || '')}</td>
+            <td>${escapeHtml(v.phone || '')}</td>
             <td>${v.is_1099 ? '<span class="pill pill-gold">1099</span>' : '<span class="muted">—</span>'}</td>
             <td>${v.w9_url ? `<a href="#" class="w9-link" data-path="${escapeHtml(v.w9_url)}">View</a>` : '<span class="muted">—</span>'}</td>
             <td>
@@ -158,6 +179,7 @@ function renderTable(rows) {
       } catch (err) { toast('Could not open COI: ' + err.message, { kind: 'error' }); }
     };
   });
+  attachSortHandlers(wrap, MOD, () => renderTable(rows));
 }
 
 function editVendor(record, accounts, onDone) {
@@ -251,13 +273,11 @@ function editVendor(record, accounts, onDone) {
         };
         if (!data.name) { toast('Name is required', { kind: 'error' }); return false; }
 
-        // Handle COI removal flag
         const fileInput = bg.querySelector('#f-coi-file');
         const file = fileInput?.files?.[0];
         const cleared = bg.dataset.coiCleared === '1';
 
         try {
-          // Upsert vendor first
           let vendorId = r.id;
           if (isNew) {
             const ins = await q(supabase.from('vendors').insert({ ...data, coi_url: null }).select().single());
@@ -266,14 +286,12 @@ function editVendor(record, accounts, onDone) {
             await q(supabase.from('vendors').update(data).eq('id', r.id));
           }
 
-          // Handle file upload
           if (file) {
             if (file.size > 10485760) { toast('File too large (max 10MB)', { kind: 'error' }); return false; }
             const ext = (file.name.split('.').pop() || 'pdf').toLowerCase();
             const path = `${vendorId}/coi-${Date.now()}.${ext}`;
             const { error: upErr } = await supabase.storage.from('coi-documents').upload(path, file, { upsert: false });
             if (upErr) throw new Error('Upload failed: ' + upErr.message);
-            // Delete old file if present
             if (r.coi_url) {
               await supabase.storage.from('coi-documents').remove([r.coi_url]).catch(() => {});
             }
@@ -293,7 +311,6 @@ function editVendor(record, accounts, onDone) {
     ],
   });
 
-  // Wire post-mount handlers (View current, Remove)
   setTimeout(() => {
     const bg = document.querySelector('.modal');
     if (!bg) return;
