@@ -5,6 +5,21 @@ import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, daysPastDue, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const MOD = 'invoices';
+
+const COLUMNS = [
+  { key: 'invoice_number', label: 'Invoice #', type: 'string' },
+  { key: 'customer_name',  label: 'Customer',  type: 'string', get: r => r._customer?.name || '' },
+  { key: 'project_number', label: 'Project',   type: 'string', get: r => r._project?.project_number || '' },
+  { key: 'due_date',       label: 'Due',       type: 'date' },
+  { key: 'status',         label: 'Status',    type: 'string' },
+  { key: 'total',          label: 'Total',     type: 'number', numeric: true },
+  { key: 'amount_paid',    label: 'Paid',      type: 'number', numeric: true },
+  { key: 'open',           label: 'Open',      type: 'number', numeric: true, get: r => Number(r.total) - Number(r.amount_paid) },
+  { key: '_actions',       label: '',          sortable: false },
+];
 
 export async function renderInvoices(outlet) {
   outlet.innerHTML = `
@@ -103,14 +118,13 @@ function renderTable(rows) {
     wrap.innerHTML = `<div class="empty-state"><div class="big">NO INVOICES</div></div>`;
     return;
   }
+  const state = getSortState(MOD, { key: 'due_date', dir: 'desc' });
+  const sorted = sortRows(rows, COLUMNS, state);
   wrap.innerHTML = `
     <table class="data">
-      <thead><tr>
-        <th>Invoice #</th><th>Customer</th><th>Project</th><th>Due</th><th>Status</th>
-        <th class="numeric">Total</th><th class="numeric">Paid</th><th class="numeric">Open</th><th></th>
-      </tr></thead>
+      <thead><tr>${headerHTML(COLUMNS, state)}</tr></thead>
       <tbody>
-        ${rows.map(i => {
+        ${sorted.map(i => {
           const open = Number(i.total) - Number(i.amount_paid);
           const days = (i.status === 'void' || i.status === 'paid' || i.status === 'draft') ? 0 : daysPastDue(i.due_date);
           return `
@@ -135,6 +149,7 @@ function renderTable(rows) {
       editInvoice(inv, () => loadList());
     };
   });
+  attachSortHandlers(wrap, MOD, () => renderTable(rows));
 }
 
 async function editInvoice(record, onDone) {
