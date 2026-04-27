@@ -1,8 +1,8 @@
 // =============================================================================
-// Vendors — CRUD for AP contacts (subs, suppliers, utilities) with 1099 fields
+// Vendors — CRUD for AP contacts (subs, suppliers, utilities) with 1099 + COI
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
-import { fmtMoney, escapeHtml } from '../lib/format.js';
+import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
 
@@ -20,6 +20,7 @@ export async function renderVendors(outlet) {
     <div class="toolbar">
       <input type="search" id="ven-search" placeholder="Search vendors…" class="input" style="max-width:280px">
       <label class="muted" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="ven-1099">1099 only</label>
+      <label class="muted" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="ven-coi-issues">COI issues only</label>
     </div>
     <div id="ven-table-wrap" class="table-wrap">
       <div class="empty-state"><div class="big">LOADING</div></div>
@@ -28,6 +29,7 @@ export async function renderVendors(outlet) {
   document.getElementById('new-vendor').onclick = () => editVendor(null, [], () => loadList());
   document.getElementById('ven-search').oninput = () => filterAndRender();
   document.getElementById('ven-1099').onchange = () => filterAndRender();
+  document.getElementById('ven-coi-issues').onchange = () => filterAndRender();
   await loadList();
 }
 
@@ -53,16 +55,45 @@ async function loadList() {
   }
 }
 
+// Returns { state: 'ok' | 'expiring' | 'expired' | 'missing', daysLeft: number | null }
+function coiStatus(v) {
+  if (!v.coi_url) return { state: 'missing', daysLeft: null };
+  if (!v.coi_expiry_date) return { state: 'ok', daysLeft: null };
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const exp = new Date(v.coi_expiry_date);
+  exp.setHours(0,0,0,0);
+  const days = Math.round((exp - today) / 86400000);
+  if (days < 0) return { state: 'expired', daysLeft: days };
+  if (days <= 30) return { state: 'expiring', daysLeft: days };
+  return { state: 'ok', daysLeft: days };
+}
+
+function coiPill(v) {
+  const s = coiStatus(v);
+  if (s.state === 'missing') return '<span class="pill" style="background:rgba(226,92,92,.18);color:var(--red)">NONE</span>';
+  if (s.state === 'expired') return `<span class="pill pill-red">EXPIRED ${Math.abs(s.daysLeft)}d</span>`;
+  if (s.state === 'expiring') return `<span class="pill pill-amber">${s.daysLeft}d LEFT</span>`;
+  return s.daysLeft != null
+    ? `<span class="pill pill-green">VALID</span>`
+    : '<span class="pill pill-green">ON FILE</span>';
+}
+
 function filterAndRender() {
   const all = window.__venAll || [];
   const term = (document.getElementById('ven-search')?.value || '').trim().toLowerCase();
   const only1099 = document.getElementById('ven-1099')?.checked;
+  const onlyCoi = document.getElementById('ven-coi-issues')?.checked;
   let rows = all;
   if (term) rows = rows.filter(v =>
     (v.name || '').toLowerCase().includes(term) ||
     (v.email || '').toLowerCase().includes(term) ||
     (v.contact || '').toLowerCase().includes(term));
   if (only1099) rows = rows.filter(v => v.is_1099);
+  if (onlyCoi) rows = rows.filter(v => {
+    const s = coiStatus(v).state;
+    return s === 'missing' || s === 'expired' || s === 'expiring';
+  });
   renderTable(rows);
 }
 
@@ -75,7 +106,9 @@ function renderTable(rows) {
   wrap.innerHTML = `
     <table class="data">
       <thead><tr>
-        <th>Name</th><th>Contact</th><th>Email / Phone</th><th>1099</th><th>W-9</th><th class="numeric">Open AP</th><th></th>
+        <th>Name</th><th>Contact</th><th>Email / Phone</th>
+        <th>1099</th><th>W-9</th><th>COI</th>
+        <th class="numeric">Open AP</th><th></th>
       </tr></thead>
       <tbody>
         ${rows.map(v => `
@@ -88,6 +121,10 @@ function renderTable(rows) {
             </td>
             <td>${v.is_1099 ? '<span class="pill pill-gold">1099</span>' : '<span class="muted">—</span>'}</td>
             <td>${v.w9_url ? `<a href="#" class="w9-link" data-path="${escapeHtml(v.w9_url)}">View</a>` : '<span class="muted">—</span>'}</td>
+            <td>
+              ${coiPill(v)}
+              ${v.coi_url ? `<div style="margin-top:2px"><a href="#" class="coi-link" data-path="${escapeHtml(v.coi_url)}" style="font-size:11px">View</a>${v.coi_expiry_date ? ` <span class="muted" style="font-size:11px">exp ${fmtDate(v.coi_expiry_date)}</span>` : ''}</div>` : ''}
+            </td>
             <td class="numeric">${v._ap > 0 ? fmtMoney(v._ap) : '<span class="muted">—</span>'}</td>
             <td><button class="btn-sm btn-ghost edit-btn" data-id="${v.id}">Edit</button></td>
           </tr>
@@ -111,14 +148,37 @@ function renderTable(rows) {
       } catch (err) { toast('Could not open W-9: ' + err.message, { kind: 'error' }); }
     };
   });
+  wrap.querySelectorAll('.coi-link').forEach(a => {
+    a.onclick = async (e) => {
+      e.preventDefault();
+      try {
+        const { data, error } = await supabase.storage.from('coi-documents').createSignedUrl(a.dataset.path, 600);
+        if (error) throw error;
+        window.open(data.signedUrl, '_blank');
+      } catch (err) { toast('Could not open COI: ' + err.message, { kind: 'error' }); }
+    };
+  });
 }
 
 function editVendor(record, accounts, onDone) {
   const isNew = !record;
-  const r = record || { name: '', contact: '', email: '', phone: '', address: '', is_1099: false, payment_method: 'check', notes: '', default_expense_account: null };
+  const r = record || {
+    name: '', contact: '', email: '', phone: '', address: '',
+    is_1099: false, payment_method: 'check', notes: '',
+    default_expense_account: null,
+    coi_url: null, coi_expiry_date: null, coi_received_date: null,
+  };
   const accOpts = accounts.map(a =>
     `<option value="${a.id}" ${a.id === r.default_expense_account ? 'selected' : ''}>${escapeHtml(a.account_number)} — ${escapeHtml(a.name)}</option>`
   ).join('');
+  const coiState = coiStatus(r);
+  const coiBadge = r.coi_url
+    ? (coiState.state === 'expired'
+        ? `<span class="pill pill-red" style="margin-left:8px">EXPIRED ${Math.abs(coiState.daysLeft)}d ago</span>`
+        : coiState.state === 'expiring'
+          ? `<span class="pill pill-amber" style="margin-left:8px">${coiState.daysLeft}d left</span>`
+          : `<span class="pill pill-green" style="margin-left:8px">VALID</span>`)
+    : '';
   modal({
     title: isNew ? 'New Vendor' : 'Edit Vendor',
     bodyHTML: `
@@ -143,7 +203,26 @@ function editVendor(record, accounts, onDone) {
         <input type="checkbox" id="f-1099" ${r.is_1099 ? 'checked' : ''}>
         <label for="f-1099" class="field-label" style="margin:0">1099 Vendor (subcontractor)</label>
       </div>
-      <div class="field"><label class="field-label">Notes</label><textarea class="input" id="f-notes" rows="2">${escapeHtml(r.notes || '')}</textarea></div>
+
+      <div style="border-top:1px solid var(--hairline);margin:14px 0 0;padding-top:14px">
+        <div class="section-title" style="margin-bottom:10px">CERTIFICATE OF INSURANCE (COI)${coiBadge}</div>
+        ${r.coi_url ? `
+          <div class="muted" style="margin-bottom:8px">
+            Current file on record. <a href="#" id="coi-current-view">View</a>
+            <button class="btn-sm btn-ghost" id="coi-clear" type="button" style="margin-left:8px">Remove</button>
+          </div>
+        ` : ''}
+        <div class="field">
+          <label class="field-label">${r.coi_url ? 'Replace with new file' : 'Upload COI'} (PDF or image, max 10MB)</label>
+          <input class="input" id="f-coi-file" type="file" accept="application/pdf,image/*">
+        </div>
+        <div class="field-row">
+          <div class="field"><label class="field-label">COI Received Date</label><input class="input" id="f-coi-recv" type="date" value="${r.coi_received_date || ''}"></div>
+          <div class="field"><label class="field-label">COI Expiry Date</label><input class="input" id="f-coi-exp" type="date" value="${r.coi_expiry_date || ''}"></div>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:14px"><label class="field-label">Notes</label><textarea class="input" id="f-notes" rows="2">${escapeHtml(r.notes || '')}</textarea></div>
     `,
     actions: [
       ...(isNew ? [] : [{ label: 'Delete', kind: 'danger', onClick: async () => {
@@ -167,15 +246,81 @@ function editVendor(record, accounts, onDone) {
           default_expense_account: bg.querySelector('#f-acct').value || null,
           is_1099: bg.querySelector('#f-1099').checked,
           notes: bg.querySelector('#f-notes').value.trim() || null,
+          coi_received_date: bg.querySelector('#f-coi-recv').value || null,
+          coi_expiry_date: bg.querySelector('#f-coi-exp').value || null,
         };
         if (!data.name) { toast('Name is required', { kind: 'error' }); return false; }
+
+        // Handle COI removal flag
+        const fileInput = bg.querySelector('#f-coi-file');
+        const file = fileInput?.files?.[0];
+        const cleared = bg.dataset.coiCleared === '1';
+
         try {
-          if (isNew) await q(supabase.from('vendors').insert(data));
-          else await q(supabase.from('vendors').update(data).eq('id', r.id));
+          // Upsert vendor first
+          let vendorId = r.id;
+          if (isNew) {
+            const ins = await q(supabase.from('vendors').insert({ ...data, coi_url: null }).select().single());
+            vendorId = ins.id;
+          } else {
+            await q(supabase.from('vendors').update(data).eq('id', r.id));
+          }
+
+          // Handle file upload
+          if (file) {
+            if (file.size > 10485760) { toast('File too large (max 10MB)', { kind: 'error' }); return false; }
+            const ext = (file.name.split('.').pop() || 'pdf').toLowerCase();
+            const path = `${vendorId}/coi-${Date.now()}.${ext}`;
+            const { error: upErr } = await supabase.storage.from('coi-documents').upload(path, file, { upsert: false });
+            if (upErr) throw new Error('Upload failed: ' + upErr.message);
+            // Delete old file if present
+            if (r.coi_url) {
+              await supabase.storage.from('coi-documents').remove([r.coi_url]).catch(() => {});
+            }
+            await q(supabase.from('vendors').update({ coi_url: path }).eq('id', vendorId));
+          } else if (cleared && r.coi_url) {
+            await supabase.storage.from('coi-documents').remove([r.coi_url]).catch(() => {});
+            await q(supabase.from('vendors').update({ coi_url: null, coi_expiry_date: null, coi_received_date: null }).eq('id', vendorId));
+          }
+
           toast('Saved', { kind: 'success' });
           onDone && onDone();
-        } catch (e) { toast('Save failed: ' + e.message, { kind: 'error' }); return false; }
+        } catch (e) {
+          toast('Save failed: ' + e.message, { kind: 'error' });
+          return false;
+        }
       } },
     ],
   });
+
+  // Wire post-mount handlers (View current, Remove)
+  setTimeout(() => {
+    const bg = document.querySelector('.modal');
+    if (!bg) return;
+    const viewBtn = bg.querySelector('#coi-current-view');
+    if (viewBtn) {
+      viewBtn.onclick = async (e) => {
+        e.preventDefault();
+        try {
+          const { data, error } = await supabase.storage.from('coi-documents').createSignedUrl(r.coi_url, 600);
+          if (error) throw error;
+          window.open(data.signedUrl, '_blank');
+        } catch (err) { toast('Could not open COI: ' + err.message, { kind: 'error' }); }
+      };
+    }
+    const clearBtn = bg.querySelector('#coi-clear');
+    if (clearBtn) {
+      clearBtn.onclick = (e) => {
+        e.preventDefault();
+        bg.dataset.coiCleared = '1';
+        const note = document.createElement('div');
+        note.className = 'muted';
+        note.style.cssText = 'color:var(--red);font-size:11px;margin-top:4px';
+        note.textContent = 'COI will be removed when you click Save';
+        clearBtn.closest('div').appendChild(note);
+        clearBtn.disabled = true;
+        clearBtn.textContent = 'Will remove';
+      };
+    }
+  }, 50);
 }
