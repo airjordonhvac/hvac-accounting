@@ -5,6 +5,20 @@ import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const MOD = 'payments';
+
+const COLUMNS = [
+  { key: 'date',         label: 'Date',      type: 'date' },
+  { key: 'direction',    label: 'Direction', type: 'string' },
+  { key: 'method',       label: 'Method',    type: 'string' },
+  { key: 'reference',    label: 'Reference', type: 'string' },
+  { key: 'bank_name',    label: 'Bank',      type: 'string', get: r => r._bank?.name || '' },
+  { key: 'amount',       label: 'Amount',    type: 'number', numeric: true },
+  { key: 'applied_count',label: 'Applied',   type: 'number', get: r => (r._apps || []).length },
+  { key: '_actions',     label: '',          sortable: false },
+];
 
 export async function renderPayments(outlet) {
   outlet.innerHTML = `
@@ -79,14 +93,13 @@ function renderTable(rows) {
     wrap.innerHTML = `<div class="empty-state"><div class="big">NO PAYMENTS</div></div>`;
     return;
   }
+  const state = getSortState(MOD, { key: 'date', dir: 'desc' });
+  const sorted = sortRows(rows, COLUMNS, state);
   wrap.innerHTML = `
     <table class="data">
-      <thead><tr>
-        <th>Date</th><th>Direction</th><th>Method</th><th>Reference</th><th>Bank</th>
-        <th class="numeric">Amount</th><th>Applied</th><th></th>
-      </tr></thead>
+      <thead><tr>${headerHTML(COLUMNS, state)}</tr></thead>
       <tbody>
-        ${rows.map(p => {
+        ${sorted.map(p => {
           const applied = (p._apps || []).reduce((s, a) => s + Number(a.amount), 0);
           const unapplied = Number(p.amount) - applied;
           return `
@@ -110,6 +123,7 @@ function renderTable(rows) {
       editPayment(p, p.direction, () => loadList());
     };
   });
+  attachSortHandlers(wrap, MOD, () => renderTable(rows));
 }
 
 async function editPayment(record, direction, onDone) {
@@ -131,7 +145,6 @@ async function editPayment(record, direction, onDone) {
   const docMap = new Map(docs.map(d => [d.id, d]));
   const docRows = (apps) => apps.map((a, i) => {
     const docId = a[docKey];
-    const doc = docMap.get(docId);
     const docOpts = `<option value="">— Select —</option>` + docs.map(d => {
       const open = (Number(d.total) - Number(d.amount_paid)).toFixed(2);
       return `<option value="${d.id}" ${d.id === docId ? 'selected' : ''}>${escapeHtml(d[numField] || '')} — open ${open}</option>`;
@@ -235,7 +248,6 @@ async function editPayment(record, direction, onDone) {
     });
     document.querySelector('#add-app').addEventListener('click', () => {
       const tmp = document.createElement('tbody');
-      const idx = body.querySelectorAll('.app-row').length;
       tmp.innerHTML = docRows([{ amount: 0 }]);
       body.appendChild(tmp.querySelector('tr'));
     });
@@ -243,7 +255,6 @@ async function editPayment(record, direction, onDone) {
 }
 
 async function recomputePaidAll() {
-  // Recompute amount_paid for all invoices and bills based on payment_applications
   try {
     const apps = await q(supabase.from('payment_applications').select('*'));
     const invSums = new Map();
