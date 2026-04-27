@@ -5,6 +5,27 @@ import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const ACCT_MOD = 'bank_accts';
+const TX_MOD = 'bank_tx';
+
+const ACCT_COLUMNS = [
+  { key: 'name',            label: 'Name',     type: 'string' },
+  { key: 'account_type',    label: 'Type',     type: 'string' },
+  { key: 'last4',           label: 'Last 4',   type: 'string' },
+  { key: 'is_active',       label: 'Active',   type: 'number', get: r => r.is_active ? 1 : 0 },
+  { key: 'current_balance', label: 'Balance',  type: 'number', numeric: true },
+  { key: '_actions',        label: '',         sortable: false },
+];
+
+const TX_COLUMNS = [
+  { key: 'date',          label: 'Date',        type: 'date' },
+  { key: 'description',   label: 'Description', type: 'string' },
+  { key: 'amount',        label: 'Amount',      type: 'number', numeric: true },
+  { key: 'balance_after', label: 'Balance',     type: 'number', numeric: true },
+  { key: 'reconciled',    label: 'Reconciled',  type: 'number', get: r => r.reconciled ? 1 : 0 },
+];
 
 export async function renderBank(outlet) {
   outlet.innerHTML = `
@@ -32,45 +53,52 @@ async function loadAll() {
       area.innerHTML = `<div class="empty-state"><div class="big">NO ACCOUNTS</div><div>Click "New Account" to add one.</div></div>`;
       return;
     }
-    area.innerHTML = `
-      <div class="table-wrap">
-        <table class="data">
-          <thead><tr>
-            <th>Name</th><th>Type</th><th>Last 4</th><th>Active</th>
-            <th class="numeric">Balance</th><th></th>
-          </tr></thead>
-          <tbody>
-            ${accts.map(a => `
-              <tr>
-                <td><strong>${escapeHtml(a.name)}</strong>${a.institution ? `<div class="muted">${escapeHtml(a.institution)}</div>` : ''}</td>
-                <td><span class="pill pill-gray">${(a.account_type || '').toUpperCase()}</span></td>
-                <td class="mono">${escapeHtml(a.last4 || '')}</td>
-                <td>${a.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
-                <td class="numeric">${fmtMoney(a.current_balance || 0)}</td>
-                <td>
-                  <button class="btn-sm btn-ghost view-tx" data-id="${a.id}">View Tx</button>
-                  <button class="btn-sm btn-ghost import-tx" data-id="${a.id}">Import CSV</button>
-                  <button class="btn-sm btn-ghost edit-acct" data-id="${a.id}">Edit</button>
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-      <div id="tx-view" style="margin-top:16px"></div>
-    `;
-    area.querySelectorAll('.edit-acct').forEach(b => {
-      b.onclick = () => editAccount(accts.find(a => a.id === b.dataset.id), () => loadAll());
-    });
-    area.querySelectorAll('.view-tx').forEach(b => {
-      b.onclick = () => loadTx(b.dataset.id);
-    });
-    area.querySelectorAll('.import-tx').forEach(b => {
-      b.onclick = () => importCSV(b.dataset.id, () => loadAll());
-    });
+    renderAccounts();
   } catch (e) {
     area.innerHTML = `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
   }
+}
+
+function renderAccounts() {
+  const accts = window.__bankAccts || [];
+  const area = document.getElementById('bank-area');
+  const state = getSortState(ACCT_MOD, { key: 'name', dir: 'asc' });
+  const sorted = sortRows(accts, ACCT_COLUMNS, state);
+  area.innerHTML = `
+    <div class="table-wrap" id="accts-wrap">
+      <table class="data">
+        <thead><tr>${headerHTML(ACCT_COLUMNS, state)}</tr></thead>
+        <tbody>
+          ${sorted.map(a => `
+            <tr>
+              <td><strong>${escapeHtml(a.name)}</strong>${a.institution ? `<div class="muted">${escapeHtml(a.institution)}</div>` : ''}</td>
+              <td><span class="pill pill-gray">${(a.account_type || '').toUpperCase()}</span></td>
+              <td class="mono">${escapeHtml(a.last4 || '')}</td>
+              <td>${a.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
+              <td class="numeric">${fmtMoney(a.current_balance || 0)}</td>
+              <td>
+                <button class="btn-sm btn-ghost view-tx" data-id="${a.id}">View Tx</button>
+                <button class="btn-sm btn-ghost import-tx" data-id="${a.id}">Import CSV</button>
+                <button class="btn-sm btn-ghost edit-acct" data-id="${a.id}">Edit</button>
+              </td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div id="tx-view" style="margin-top:16px"></div>
+  `;
+  const acctsWrap = document.getElementById('accts-wrap');
+  acctsWrap.querySelectorAll('.edit-acct').forEach(b => {
+    b.onclick = () => editAccount(accts.find(a => a.id === b.dataset.id), () => loadAll());
+  });
+  acctsWrap.querySelectorAll('.view-tx').forEach(b => {
+    b.onclick = () => loadTx(b.dataset.id);
+  });
+  acctsWrap.querySelectorAll('.import-tx').forEach(b => {
+    b.onclick = () => importCSV(b.dataset.id, () => loadAll());
+  });
+  attachSortHandlers(acctsWrap, ACCT_MOD, () => renderAccounts());
 }
 
 async function loadTx(bankId) {
@@ -78,32 +106,42 @@ async function loadTx(bankId) {
   wrap.innerHTML = `<div class="empty-state"><div class="big">LOADING TX</div></div>`;
   try {
     const tx = await q(supabase.from('bank_transactions').select('*').eq('bank_account_id', bankId).order('date', { ascending: false }).limit(200));
+    window.__bankTxRows = tx;
     if (!tx.length) {
       wrap.innerHTML = `<div class="empty-state"><div class="big">NO TRANSACTIONS</div></div>`;
       return;
     }
-    wrap.innerHTML = `
-      <div class="card">
-        <div class="card-header"><div class="section-title">RECENT TRANSACTIONS (last 200)</div></div>
-        <div class="table-wrap">
-          <table class="data">
-            <thead><tr><th>Date</th><th>Description</th><th class="numeric">Amount</th><th class="numeric">Balance</th><th>Reconciled</th></tr></thead>
-            <tbody>
-              ${tx.map(t => `
-                <tr>
-                  <td>${fmtDate(t.date)}</td>
-                  <td>${escapeHtml(t.description || '')}</td>
-                  <td class="numeric ${Number(t.amount) < 0 ? 'delta-down' : 'delta-up'}">${fmtMoney(t.amount)}</td>
-                  <td class="numeric">${t.balance_after != null ? fmtMoney(t.balance_after) : '<span class="muted">—</span>'}</td>
-                  <td>${t.reconciled ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-amber">PENDING</span>'}</td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    `;
+    renderTx();
   } catch (e) { wrap.innerHTML = `<div style="color:var(--red)">${escapeHtml(e.message)}</div>`; }
+}
+
+function renderTx() {
+  const tx = window.__bankTxRows || [];
+  const wrap = document.getElementById('tx-view');
+  const state = getSortState(TX_MOD, { key: 'date', dir: 'desc' });
+  const sorted = sortRows(tx, TX_COLUMNS, state);
+  wrap.innerHTML = `
+    <div class="card">
+      <div class="card-header"><div class="section-title">RECENT TRANSACTIONS (last 200)</div></div>
+      <div class="table-wrap" id="tx-wrap">
+        <table class="data">
+          <thead><tr>${headerHTML(TX_COLUMNS, state)}</tr></thead>
+          <tbody>
+            ${sorted.map(t => `
+              <tr>
+                <td>${fmtDate(t.date)}</td>
+                <td>${escapeHtml(t.description || '')}</td>
+                <td class="numeric ${Number(t.amount) < 0 ? 'delta-down' : 'delta-up'}">${fmtMoney(t.amount)}</td>
+                <td class="numeric">${t.balance_after != null ? fmtMoney(t.balance_after) : '<span class="muted">—</span>'}</td>
+                <td>${t.reconciled ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-amber">PENDING</span>'}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  attachSortHandlers(document.getElementById('tx-wrap'), TX_MOD, () => renderTx());
 }
 
 function editAccount(record, onDone) {
