@@ -4,8 +4,9 @@
 // Behavior depends on account_type:
 //   - checking / savings: clean cash-flow dashboard (deposits, withdrawals, net)
 //     with no categorization UI
-//   - credit / loc: credit-aware dashboard (amount owed, charges, payments)
-//     with category column on transactions and "Spending by Category" chart
+//   - credit_card / line_of_credit: credit-aware dashboard
+//     (amount owed, charges, payments) with category column on transactions
+//     and "Spending by Category" chart
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, fmtDateISO, escapeHtml } from '../lib/format.js';
@@ -19,10 +20,9 @@ const TX_MOD = 'bank_tx';
 // categorization, "amount owed" language, and the spending-by-category chart.
 function isCreditStyle(acct) {
   const t = acct?.account_type;
-  return t === 'credit' || t === 'loc';
+  return t === 'credit_card' || t === 'line_of_credit';
 }
 
-// Language map for credit-style accounts. Only consulted when isCreditStyle is true.
 function creditLang() {
   return {
     balanceLabel:    'AMOUNT OWED',
@@ -36,7 +36,6 @@ function creditLang() {
   };
 }
 
-// Default (bank account) language map.
 function bankLang() {
   return {
     balanceLabel:    'CURRENT BALANCE',
@@ -50,7 +49,6 @@ function bankLang() {
   };
 }
 
-// Bank account columns (no Category)
 const TX_COLUMNS_BANK = [
   { key: 'date',          label: 'Date',        type: 'date' },
   { key: 'description',   label: 'Description', type: 'string' },
@@ -59,7 +57,6 @@ const TX_COLUMNS_BANK = [
   { key: 'reconciled',    label: 'Reconciled',  type: 'number', get: r => r.reconciled ? 1 : 0 },
 ];
 
-// Credit account columns (with Category)
 const TX_COLUMNS_CREDIT = [
   { key: 'date',          label: 'Date',        type: 'date' },
   { key: 'description',   label: 'Description', type: 'string' },
@@ -68,6 +65,10 @@ const TX_COLUMNS_CREDIT = [
   { key: 'balance_after', label: 'Balance',     type: 'number', numeric: true },
   { key: 'reconciled',    label: 'Reconciled',  type: 'number', get: r => r.reconciled ? 1 : 0 },
 ];
+
+function fmtAccountType(t) {
+  return (t || '').replace('_', ' ').toUpperCase();
+}
 
 export async function renderBank(outlet) {
   outlet.innerHTML = `
@@ -131,7 +132,6 @@ function renderDashboard() {
   const L = credit ? creditLang() : bankLang();
   const txs = allTx.filter(t => t.bank_account_id === acctId);
 
-  // Show/hide the "Apply Rules to All" button based on credit-style or not
   const applyBtn = document.getElementById('apply-rules-btn');
   if (applyBtn) applyBtn.style.display = credit ? '' : 'none';
 
@@ -167,7 +167,6 @@ function renderDashboard() {
   const batchStart = lastBatchTx.length ? lastBatchTx.reduce((m, t) => t.date < m ? t.date : m, lastBatchTx[0].date) : null;
   const batchEnd = lastBatchTx.length ? lastBatchTx.reduce((m, t) => t.date > m ? t.date : m, lastBatchTx[0].date) : null;
 
-  // Uncategorized count badge — only meaningful for credit accounts
   const uncatCount = credit ? txs.filter(t => !t.category_id).length : 0;
 
   const acctOpts = accts.map(a => {
@@ -184,7 +183,7 @@ function renderDashboard() {
         </div>
         <div style="border-left:1px solid var(--hairline);padding-left:14px">
           <div class="muted" style="font-size:11px;letter-spacing:0.5px;text-transform:uppercase">Type</div>
-          <div style="font-weight:600">${escapeHtml((acct?.account_type || '').toUpperCase())}${credit ? ' 💳' : ''}</div>
+          <div style="font-weight:600">${escapeHtml(fmtAccountType(acct?.account_type))}${credit ? ' 💳' : ''}</div>
         </div>
         <div style="border-left:1px solid var(--hairline);padding-left:14px">
           <div class="muted" style="font-size:11px;letter-spacing:0.5px;text-transform:uppercase">Last 4</div>
@@ -410,7 +409,6 @@ function renderTxTable() {
   `;
   attachSortHandlers(wrap, TX_MOD, () => renderTxTable());
 
-  // Wire up inline category pickers (credit accounts only)
   if (credit) {
     wrap.querySelectorAll('.cat-picker').forEach(sel => {
       sel.onchange = async (e) => {
@@ -438,10 +436,6 @@ function renderTxTable() {
   }
 }
 
-// =============================================================================
-// SVG charts
-// =============================================================================
-
 function drawBalanceChart(txs) {
   const wrap = document.getElementById('balance-chart');
   const points = txs.filter(t => t.balance_after != null).map(t => ({
@@ -454,7 +448,6 @@ function drawBalanceChart(txs) {
   const byDate = new Map();
   for (const p of points) byDate.set(p.date, p);
   const series = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
-
   const W = 900, H = 220, M = { l: 60, r: 20, t: 10, b: 30 };
   const innerW = W - M.l - M.r;
   const innerH = H - M.t - M.b;
@@ -640,14 +633,10 @@ function monthLabel(ym) {
   return d.toLocaleDateString('en-US', { month: 'short' }) + " '" + y.slice(2);
 }
 
-// =============================================================================
-// Apply rules to all transactions retroactively (credit accounts only)
-// =============================================================================
-
 async function applyRulesToAll() {
   const ok = await confirmDialog(
     'Apply categorization rules?',
-    'This will run all active rules against ALL transactions across credit and LOC accounts and update categories where a rule matches. Existing categorizations will be overwritten if a rule matches.'
+    'This will run all active rules against transactions on credit card and line of credit accounts and update categories where a rule matches. Existing categorizations will be overwritten if a rule matches.'
   );
   if (!ok) return;
   try {
@@ -661,8 +650,7 @@ async function applyRulesToAll() {
       toast('No rules defined yet. Add some in Settings → Auto-Categorization Rules.', { kind: 'error', ms: 4000 });
       return;
     }
-    // Only categorize tx on credit-style accounts
-    const creditAcctIds = new Set(accts.filter(a => a.account_type === 'credit' || a.account_type === 'loc').map(a => a.id));
+    const creditAcctIds = new Set(accts.filter(a => a.account_type === 'credit_card' || a.account_type === 'line_of_credit').map(a => a.id));
     let updated = 0;
     for (const tx of txs) {
       if (!creditAcctIds.has(tx.bank_account_id)) continue;
@@ -688,10 +676,6 @@ async function applyRulesToAll() {
     toast('Failed: ' + e.message, { kind: 'error' });
   }
 }
-
-// =============================================================================
-// Account manager
-// =============================================================================
 
 function openAccountManager() {
   const accts = window.__bankAccts || [];
@@ -722,7 +706,7 @@ function openAccountManager() {
           ${accts.map(a => `
             <tr>
               <td>${isCreditStyle(a) ? '💳 ' : '🏦 '}<strong>${escapeHtml(a.name)}</strong>${a.institution ? `<div class="muted">${escapeHtml(a.institution)}</div>` : ''}</td>
-              <td><span class="pill pill-gray">${(a.account_type || '').toUpperCase()}</span></td>
+              <td><span class="pill pill-gray">${escapeHtml(fmtAccountType(a.account_type))}</span></td>
               <td class="mono">${escapeHtml(a.last4 || '')}</td>
               <td>${a.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
               <td class="numeric">${fmtMoney(liveBal(a))}</td>
@@ -757,10 +741,15 @@ function editAccount(record, onDone) {
     bodyHTML: `
       <div class="field"><label class="field-label">Account Name *</label><input class="input" id="f-name" value="${escapeHtml(r.name || '')}"></div>
       <div class="field-row">
-        <div class="field"><label class="field-label">Institution</label><input class="input" id="f-inst" value="${escapeHtml(r.institution || '')}"></div>
+        <div class="field"><label class="field-label">Institution *</label><input class="input" id="f-inst" value="${escapeHtml(r.institution || '')}"></div>
         <div class="field"><label class="field-label">Type</label>
           <select class="select" id="f-type">
-            ${['checking','savings','credit','loc'].map(t => `<option value="${t}" ${t === (r.account_type || 'checking') ? 'selected' : ''}>${t.toUpperCase()}</option>`).join('')}
+            ${[
+              ['checking','CHECKING'],
+              ['savings','SAVINGS'],
+              ['credit_card','CREDIT CARD'],
+              ['line_of_credit','LINE OF CREDIT'],
+            ].map(([v,lbl]) => `<option value="${v}" ${v === (r.account_type || 'checking') ? 'selected' : ''}>${lbl}</option>`).join('')}
           </select>
         </div>
       </div>
@@ -772,7 +761,7 @@ function editAccount(record, onDone) {
         <input type="checkbox" id="f-active" ${r.is_active !== false ? 'checked' : ''}>
         <label for="f-active" class="field-label" style="margin:0">Active</label>
       </div>
-      <div class="muted" style="font-size:11px;margin-top:6px">For credit cards or lines of credit, set type to CREDIT or LOC — the dashboard flips language to AMOUNT OWED, CHARGES, PAYMENTS and adds category tracking. Last 4 is matched against uploaded statements.</div>
+      <div class="muted" style="font-size:11px;margin-top:6px">For credit cards or lines of credit, set type to CREDIT CARD or LINE OF CREDIT — the dashboard flips language to AMOUNT OWED, CHARGES, PAYMENTS and adds category tracking. Last 4 is matched against uploaded statements.</div>
     `,
     actions: [
       ...(isNew ? [] : [{ label: 'Delete', kind: 'danger', onClick: async () => {
@@ -792,6 +781,7 @@ function editAccount(record, onDone) {
           is_active: bg.querySelector('#f-active').checked,
         };
         if (!data.name) { toast('Name is required', { kind: 'error' }); return false; }
+        if (!data.institution) { toast('Institution is required', { kind: 'error' }); return false; }
         if (!data.last4 || data.last4.length !== 4) { toast('Last 4 digits are required (4 chars)', { kind: 'error' }); return false; }
         try {
           if (isNew) await q(supabase.from('bank_accounts').insert(data));
@@ -803,10 +793,6 @@ function editAccount(record, onDone) {
     ],
   });
 }
-
-// =============================================================================
-// CSV import
-// =============================================================================
 
 function importCSV(bankId, onDone) {
   modal({
