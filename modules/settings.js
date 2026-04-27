@@ -5,6 +5,24 @@ import { supabase, q } from '../lib/supabase.js';
 import { escapeHtml, fmtDate } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const COA_MOD = 'coa';
+const LOCKS_MOD = 'locks';
+
+const COA_COLUMNS = [
+  { key: 'account_number', label: '#',       type: 'string' },
+  { key: 'name',           label: 'Name',    type: 'string' },
+  { key: 'type',           label: 'Type',    type: 'string' },
+  { key: 'is_active',      label: 'Active',  type: 'number', get: r => r.is_active ? 1 : 0 },
+  { key: '_actions',       label: '',        sortable: false },
+];
+
+const LOCK_COLUMNS = [
+  { key: 'tax_year',  label: 'Year',      type: 'number' },
+  { key: 'locked_at', label: 'Locked At', type: 'date' },
+  { key: '_actions',  label: '',          sortable: false },
+];
 
 export async function renderSettings(outlet) {
   outlet.innerHTML = `
@@ -35,39 +53,49 @@ export async function renderSettings(outlet) {
 }
 
 async function loadCOA() {
-  const wrap = document.getElementById('coa-table-wrap');
   try {
     const accounts = await q(supabase.from('chart_of_accounts').select('*').order('account_number'));
     window.__coaAll = accounts;
     if (!accounts.length) {
-      wrap.innerHTML = `<div class="empty-state"><div class="big">NO ACCOUNTS</div><div>Run the COA seed migration to populate.</div></div>`;
+      document.getElementById('coa-table-wrap').innerHTML =
+        `<div class="empty-state"><div class="big">NO ACCOUNTS</div><div>Run the COA seed migration to populate.</div></div>`;
       return;
     }
-    wrap.innerHTML = `
-      <table class="data">
-        <thead><tr><th>#</th><th>Name</th><th>Type</th><th>Active</th><th></th></tr></thead>
-        <tbody>
-          ${accounts.map(a => `
-            <tr>
-              <td class="mono">${escapeHtml(a.account_number)}</td>
-              <td>${escapeHtml(a.name)}</td>
-              <td><span class="pill pill-gray">${escapeHtml(a.type.toUpperCase())}</span></td>
-              <td>${a.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
-              <td><button class="btn-sm btn-ghost edit-acct" data-id="${a.id}">Edit</button></td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
-    `;
-    wrap.querySelectorAll('.edit-acct').forEach(b => {
-      b.onclick = () => {
-        const a = (window.__coaAll || []).find(x => x.id === b.dataset.id);
-        editAccount(a, () => loadCOA());
-      };
-    });
+    renderCOA();
   } catch (e) {
-    wrap.innerHTML = `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
+    document.getElementById('coa-table-wrap').innerHTML =
+      `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
   }
+}
+
+function renderCOA() {
+  const accounts = window.__coaAll || [];
+  const wrap = document.getElementById('coa-table-wrap');
+  const state = getSortState(COA_MOD, { key: 'account_number', dir: 'asc' });
+  const sorted = sortRows(accounts, COA_COLUMNS, state);
+  wrap.innerHTML = `
+    <table class="data">
+      <thead><tr>${headerHTML(COA_COLUMNS, state)}</tr></thead>
+      <tbody>
+        ${sorted.map(a => `
+          <tr>
+            <td class="mono">${escapeHtml(a.account_number)}</td>
+            <td>${escapeHtml(a.name)}</td>
+            <td><span class="pill pill-gray">${escapeHtml(a.type.toUpperCase())}</span></td>
+            <td>${a.is_active ? '<span class="pill pill-green">YES</span>' : '<span class="pill pill-red">NO</span>'}</td>
+            <td><button class="btn-sm btn-ghost edit-acct" data-id="${a.id}">Edit</button></td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  wrap.querySelectorAll('.edit-acct').forEach(b => {
+    b.onclick = () => {
+      const a = (window.__coaAll || []).find(x => x.id === b.dataset.id);
+      editAccount(a, () => loadCOA());
+    };
+  });
+  attachSortHandlers(wrap, COA_MOD, () => renderCOA());
 }
 
 function editAccount(record, onDone) {
@@ -112,41 +140,51 @@ function editAccount(record, onDone) {
 }
 
 async function loadLocks() {
-  const wrap = document.getElementById('locks-wrap');
   try {
     const locks = await q(supabase.from('tax_year_locks').select('*').order('tax_year', { ascending: false }));
+    window.__locksAll = locks;
     if (!locks.length) {
-      wrap.innerHTML = `<div class="empty-state"><div class="muted">No tax years locked yet.</div></div>`;
+      document.getElementById('locks-wrap').innerHTML = `<div class="empty-state"><div class="muted">No tax years locked yet.</div></div>`;
       return;
     }
-    wrap.innerHTML = `
-      <table class="data">
-        <thead><tr><th>Year</th><th>Locked At</th><th></th></tr></thead>
-        <tbody>
-          ${locks.map(l => `
-            <tr>
-              <td class="mono"><strong>${l.tax_year}</strong></td>
-              <td>${fmtDate(l.locked_at)}</td>
-              <td><button class="btn-sm btn-ghost unlock-btn" data-year="${l.tax_year}">Unlock</button></td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
-    `;
-    wrap.querySelectorAll('.unlock-btn').forEach(b => {
-      b.onclick = async () => {
-        const ok = await confirmDialog('Unlock tax year?', `This will allow edits to year ${b.dataset.year} entries. Confirm?`);
-        if (!ok) return;
-        try {
-          await q(supabase.from('tax_year_locks').delete().eq('tax_year', Number(b.dataset.year)));
-          toast('Unlocked', { kind: 'success' });
-          loadLocks();
-        } catch (e) { toast('Unlock failed: ' + e.message, { kind: 'error' }); }
-      };
-    });
+    renderLocks();
   } catch (e) {
-    wrap.innerHTML = `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
+    document.getElementById('locks-wrap').innerHTML =
+      `<div class="empty-state"><div style="color:var(--red)">${escapeHtml(e.message)}</div></div>`;
   }
+}
+
+function renderLocks() {
+  const locks = window.__locksAll || [];
+  const wrap = document.getElementById('locks-wrap');
+  const state = getSortState(LOCKS_MOD, { key: 'tax_year', dir: 'desc' });
+  const sorted = sortRows(locks, LOCK_COLUMNS, state);
+  wrap.innerHTML = `
+    <table class="data">
+      <thead><tr>${headerHTML(LOCK_COLUMNS, state)}</tr></thead>
+      <tbody>
+        ${sorted.map(l => `
+          <tr>
+            <td class="mono"><strong>${l.tax_year}</strong></td>
+            <td>${fmtDate(l.locked_at)}</td>
+            <td><button class="btn-sm btn-ghost unlock-btn" data-year="${l.tax_year}">Unlock</button></td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  wrap.querySelectorAll('.unlock-btn').forEach(b => {
+    b.onclick = async () => {
+      const ok = await confirmDialog('Unlock tax year?', `This will allow edits to year ${b.dataset.year} entries. Confirm?`);
+      if (!ok) return;
+      try {
+        await q(supabase.from('tax_year_locks').delete().eq('tax_year', Number(b.dataset.year)));
+        toast('Unlocked', { kind: 'success' });
+        loadLocks();
+      } catch (e) { toast('Unlock failed: ' + e.message, { kind: 'error' }); }
+    };
+  });
+  attachSortHandlers(wrap, LOCKS_MOD, () => renderLocks());
 }
 
 function addLock(onDone) {
