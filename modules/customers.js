@@ -5,6 +5,19 @@ import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
 import { confirmDialog, modal } from '../lib/modal.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const MOD = 'customers';
+
+const COLUMNS = [
+  { key: 'name',           label: 'Name',    type: 'string' },
+  { key: 'company',        label: 'Company', type: 'string' },
+  { key: 'email',          label: 'Email',   type: 'string' },
+  { key: 'phone',          label: 'Phone',   type: 'string' },
+  { key: 'payment_terms',  label: 'Terms',   type: 'string' },
+  { key: '_ar',            label: 'Open AR', type: 'number', numeric: true },
+  { key: '_actions',       label: '',        sortable: false },
+];
 
 export async function renderCustomers(outlet) {
   outlet.innerHTML = `
@@ -35,7 +48,6 @@ async function loadList(outlet) {
   const wrap = document.getElementById('cust-table-wrap');
   try {
     const data = await q(supabase.from('customers').select('*').order('name'));
-    // Pull AR balances per customer
     const ar = await q(supabase.from('invoices').select('customer_id, total, amount_paid, status'));
     const arByCust = new Map();
     for (const r of ar) {
@@ -67,21 +79,13 @@ function renderTable(rows) {
     wrap.innerHTML = `<div class="empty-state"><div class="big">NO CUSTOMERS</div><div>Click "New Customer" to add one.</div></div>`;
     return;
   }
+  const state = getSortState(MOD, { key: 'name', dir: 'asc' });
+  const sorted = sortRows(rows, COLUMNS, state);
   wrap.innerHTML = `
     <table class="data">
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Company</th>
-          <th>Email</th>
-          <th>Phone</th>
-          <th>Terms</th>
-          <th class="numeric">Open AR</th>
-          <th></th>
-        </tr>
-      </thead>
+      <thead><tr>${headerHTML(COLUMNS, state)}</tr></thead>
       <tbody>
-        ${rows.map(c => `
+        ${sorted.map(c => `
           <tr data-id="${c.id}" class="clickable">
             <td><strong>${escapeHtml(c.name)}</strong></td>
             <td>${escapeHtml(c.company || '')}</td>
@@ -103,6 +107,7 @@ function renderTable(rows) {
       editCustomer(c, () => loadList());
     };
   });
+  attachSortHandlers(wrap, MOD, () => renderTable(rows));
 }
 
 function editCustomer(record, onDone) {
