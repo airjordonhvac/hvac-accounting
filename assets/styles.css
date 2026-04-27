@@ -989,3 +989,42 @@ table.data thead th[data-sort-key]:hover,
 table.data thead th .sortable-th:hover {
   color: var(--ink-900);
 }
+
+
+/* =============================================================================
+   ADDITIONS for AR/AP summary band (billed/collected/open/paid/partial/overdue)
+   ============================================================================= */
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin: 0 0 14px;
+}
+.summary-cell {
+  background: var(--white);
+  padding: 12px 16px;
+  border-radius: var(--card-radius);
+  box-shadow: var(--shadow-sm);
+  border-left: 3px solid var(--gold);
+}
+.summary-cell .muted {
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--ink-500);
+}
+.summary-cell .big {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-900);
+  margin: 4px 0 2px;
+  line-height: 1.1;
+}
+
+@media (max-width: 1100px) {
+  .summary-grid { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 700px) {
+  .summary-grid { grid-template-columns: repeat(2, 1fr); }
+}
