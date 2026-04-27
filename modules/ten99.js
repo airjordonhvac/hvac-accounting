@@ -2,8 +2,19 @@
 // 1099s — Year-end 1099-NEC tracking with IRS-format CSV export
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
-import { fmtMoney, fmtDate, fmtDateISO, escapeHtml } from '../lib/format.js';
+import { fmtMoney, escapeHtml } from '../lib/format.js';
 import { toast } from '../lib/toast.js';
+import { sortRows, headerHTML, attachSortHandlers, getSortState } from '../lib/sort.js';
+
+const MOD = 'ten99';
+
+const COLUMNS = [
+  { key: 'name',    label: 'Vendor',  type: 'string' },
+  { key: 'address', label: 'Address', type: 'string' },
+  { key: 'tax_id',  label: 'Tax ID',  type: 'string' },
+  { key: 'w9',      label: 'W-9',     type: 'string' },
+  { key: 'total',   label: 'YTD',     type: 'number', numeric: true },
+];
 
 export async function renderTen99(outlet) {
   const currentYear = new Date().getFullYear();
@@ -49,7 +60,6 @@ async function load() {
     const billVendor = new Map(bills.map(b => [b.id, b.vendor_id]));
     const payIds = new Set(payments.map(p => p.id));
     const ven1099Ids = new Set(vendors.map(v => v.id));
-    // For each application that targets a bill belonging to a 1099 vendor, sum amount
     const totals = new Map();
     for (const a of applications) {
       if (!a.bill_id || !payIds.has(a.payment_id)) continue;
@@ -64,7 +74,7 @@ async function load() {
       tax_id: v.tax_id_encrypted ? '✓ on file' : 'MISSING',
       w9: v.w9_url ? 'YES' : 'NO',
       total: totals.get(v.id) || 0,
-    })).sort((a, b) => b.total - a.total);
+    }));
     render();
   } catch (e) {
     document.getElementById('ten99-table-wrap').innerHTML =
@@ -82,14 +92,14 @@ function render() {
     return;
   }
   const total = rows.reduce((s, r) => s + r.total, 0);
+  const state = getSortState(MOD, { key: 'total', dir: 'desc' });
+  const sorted = sortRows(rows, COLUMNS, state);
   wrap.innerHTML = `
     <div style="margin-bottom:10px"><strong>${rows.length}</strong> vendor${rows.length === 1 ? '' : 's'} · Total: <strong>${fmtMoney(total)}</strong></div>
     <table class="data">
-      <thead><tr>
-        <th>Vendor</th><th>Address</th><th>Tax ID</th><th>W-9</th><th class="numeric">YTD ${window.__year}</th>
-      </tr></thead>
+      <thead><tr>${headerHTML(COLUMNS, state)}</tr></thead>
       <tbody>
-        ${rows.map(r => `
+        ${sorted.map(r => `
           <tr>
             <td><strong>${escapeHtml(r.name)}</strong></td>
             <td>${escapeHtml(r.address)}</td>
@@ -101,12 +111,12 @@ function render() {
       </tbody>
     </table>
   `;
+  attachSortHandlers(wrap, MOD, () => render());
 }
 
 function exportCSV() {
   const rows = (window.__rows || []).filter(r => r.total >= 600);
   if (!rows.length) { toast('No qualifying vendors to export', { kind: 'error' }); return; }
-  // IRS 1099-NEC format (simplified): Payer, Recipient, TIN, Address, Box 1 (nonemployee comp)
   const data = [['Payer Name', 'Payer TIN', 'Recipient Name', 'Recipient TIN', 'Recipient Address', 'Box 1 NEC Amount'],
     ...rows.map(r => ['Air Jordon HVAC LLC', '', r.name, '', r.address, r.total.toFixed(2)])];
   const csv = data.map(row => row.map(v => {
