@@ -283,6 +283,10 @@ async function runMerge(source, target) {
   try {
     await supabase.from('payments').update({ vendor_id: target.id }).eq('vendor_id', source.id).select('id');
   } catch (e) { /* payments may not have vendor_id */ }
+  // Reassign pending_entries that matched the source vendor (FK constraint requires this before delete)
+  try {
+    await supabase.from('pending_entries').update({ matched_vendor_id: target.id }).eq('matched_vendor_id', source.id).select('id');
+  } catch (e) { /* pending_entries may not exist or column missing */ }
   const updates = {};
   if (!target.email && source.email) updates.email = source.email;
   if (!target.phone && source.phone) updates.phone = source.phone;
