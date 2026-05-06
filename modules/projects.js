@@ -47,7 +47,7 @@ export async function renderProjects(outlet) {
     </div>
   `;
 
-  document.getElementById('new-proj').onclick = () => editProject(null, [], () => loadList());
+  document.getElementById('new-proj').onclick = () => editProject(null, window.__projCustomers || [], () => loadList());
   document.getElementById('proj-search').oninput = () => filterAndRender();
   document.getElementById('proj-status').onchange = () => filterAndRender();
 
