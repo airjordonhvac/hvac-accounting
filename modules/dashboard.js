@@ -1,322 +1,460 @@
 // =============================================================================
-// Dashboard
-// -----------------------------------------------------------------------------
-// Six cards + cash flow sparkline. All numbers are live queries against
-// Supabase (no caching — these are small queries and accountants want the
-// freshest number).
-//
-// Cards:
-//   1. Total AR          - sum(invoices.total - amount_paid) where status != void
-//   2. AR > 30 days      - same but filtered by due_date >= 31 days ago
-//   3. Total AP          - sum(bills.total - amount_paid) where status != void
-//   4. AP due this week  - same but filtered by due_date <= today + 7
-//   5. Cash position     - sum(bank_accounts.current_balance) where is_active
-//   6. 1099 vendors YTD  - count of vendors in v_1099_vendor_year with >= $600
-//
-// Cash flow sparkline: daily net of payments (received - sent) for last 90 days.
+// Dashboard — cash reality, YTD profit/loss, AR/AP aging, charts
 // =============================================================================
+import { supabase, q } from '../lib/supabase.js';
+import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
 
-import { supabase } from '../lib/supabase.js';
-import { fmtMoney, fmtDateShort } from '../lib/format.js';
+// Period state for the toggle (calendar year vs trailing 12 months)
+// Persisted on window so it survives re-renders within same session.
+function getPeriod() {
+  return window.__dashPeriod || 'ytd';
+}
+function setPeriod(p) {
+  window.__dashPeriod = p;
+}
+
+function periodLabel(p) {
+  const yr = new Date().getFullYear();
+  return p === 'ytd' ? `${yr} YTD` : 'Last 12 Months';
+}
+
+// Returns ISO date strings for the period start (and "today" for end).
+function periodRange(p) {
+  const today = new Date();
+  const todayISO = today.toISOString().slice(0, 10);
+  if (p === 'ytd') {
+    return { start: `${today.getFullYear()}-01-01`, end: todayISO, label: `${today.getFullYear()} YTD` };
+  }
+  // 12-month: 365 days back, including today
+  const past = new Date(today);
+  past.setFullYear(past.getFullYear() - 1);
+  past.setDate(past.getDate() + 1);
+  return { start: past.toISOString().slice(0, 10), end: todayISO, label: 'Last 12 Months' };
+}
 
 export async function renderDashboard(outlet) {
   outlet.innerHTML = `
     <div class="page-head">
       <div class="page-head-left">
         <h1>DASHBOARD</h1>
-        <div class="page-head-sub">${todayLabel()}</div>
+        <div class="page-head-sub">${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}</div>
+      </div>
+    </div>
+    <div id="dash-area"><div class="empty-state"><div class="big">LOADING</div></div></div>
+  `;
+  await loadAndRender();
+}
+
+async function loadAndRender() {
+  const area = document.getElementById('dash-area');
+  try {
+    // Fetch all data we need in parallel
+    const [accts, txs, invoices, bills, vendors] = await Promise.all([
+      q(supabase.from('bank_accounts').select('*').eq('is_active', true)),
+      q(supabase.from('bank_transactions').select('id, bank_account_id, date, amount, balance_after, description, category_id, created_at').order('date', { ascending: true })),
+      q(supabase.from('invoices').select('id, customer_id, total, amount_paid, status, due_date, voided_at')),
+      q(supabase.from('bills').select('id, vendor_id, total, amount_paid, status, due_date, voided_at')),
+      q(supabase.from('vendors').select('id, is_1099')),
+    ]);
+    // Optional: categories + projects (used by spending chart and active-projects tile)
+    let cats = [], projects = [];
+    try { cats = await q(supabase.from('transaction_categories').select('*')); } catch (e) {}
+    try { projects = await q(supabase.from('projects').select('id, status, contract_amount').eq('status', 'active')); } catch (e) {}
+
+    window.__dashData = { accts, txs, invoices, bills, vendors, cats, projects };
+    paint();
+  } catch (e) {
+    area.innerHTML = `<div class="empty-state"><div class="big" style="color:var(--red)">ERROR</div><div>${escapeHtml(e.message)}</div></div>`;
+  }
+}
+
+function paint() {
+  const { accts, txs, invoices, bills, cats, projects } = window.__dashData;
+  const period = getPeriod();
+  const range = periodRange(period);
+
+  // -------- Account splits --------
+  const cashAccts = accts.filter(a => a.account_type === 'checking' || a.account_type === 'savings');
+  const creditAccts = accts.filter(a => a.account_type === 'credit_card' || a.account_type === 'line_of_credit');
+  const cashAcctIds = new Set(cashAccts.map(a => a.id));
+  const creditAcctIds = new Set(creditAccts.map(a => a.id));
+
+  // Latest balance_after per account (descending date, then created_at)
+  function latestBalance(acctId) {
+    const list = txs.filter(t => t.bank_account_id === acctId);
+    const sorted = [...list].sort((a, b) =>
+      b.date.localeCompare(a.date) || (b.created_at || '').localeCompare(a.created_at || '')
+    );
+    const withBal = sorted.find(t => t.balance_after != null);
+    return withBal ? Number(withBal.balance_after) : Number(accts.find(a => a.id === acctId)?.current_balance || 0);
+  }
+  const cashOnHand = cashAccts.reduce((sum, a) => sum + latestBalance(a.id), 0);
+  const creditDebt = creditAccts.reduce((sum, a) => sum + latestBalance(a.id), 0);
+  const netPosition = cashOnHand - creditDebt;
+
+  // -------- YTD Money In / Out / Net --------
+  const periodTxs = txs.filter(t => t.date >= range.start && t.date <= range.end);
+  let moneyIn = 0, moneyOut = 0;
+  for (const t of periodTxs) {
+    if (!cashAcctIds.has(t.bank_account_id)) continue;
+    const amt = Number(t.amount);
+    if (amt > 0) moneyIn += amt;
+    else moneyOut += Math.abs(amt);
+  }
+  // Add current credit-account debt to costs (carried unpaid spending)
+  const totalCosts = moneyOut + creditDebt;
+  const netCashFlow = moneyIn - totalCosts;
+
+  // -------- AR aging --------
+  const today = new Date().toISOString().slice(0, 10);
+  function bucketize(records) {
+    const buckets = { current: 0, b30: 0, b60: 0, b90: 0, b90plus: 0, total: 0, count: 0 };
+    for (const r of records) {
+      if (r.voided_at || r.status === 'void') continue;
+      const open = Number(r.total || 0) - Number(r.amount_paid || 0);
+      if (open <= 0.01) continue;
+      buckets.total += open;
+      buckets.count++;
+      if (!r.due_date || r.due_date >= today) {
+        buckets.current += open;
+      } else {
+        const days = Math.floor((new Date(today) - new Date(r.due_date)) / 86400000);
+        if (days <= 30) buckets.b30 += open;
+        else if (days <= 60) buckets.b60 += open;
+        else if (days <= 90) buckets.b90 += open;
+        else buckets.b90plus += open;
+      }
+    }
+    return buckets;
+  }
+  const arAging = bucketize(invoices);
+  const apAging = bucketize(bills);
+
+  // Bills due in next 7 days
+  const sevenDaysOut = new Date(); sevenDaysOut.setDate(sevenDaysOut.getDate() + 7);
+  const sevenISO = sevenDaysOut.toISOString().slice(0, 10);
+  const dueThisWeek = bills.filter(b => {
+    if (b.voided_at || b.status === 'void' || b.status === 'paid') return false;
+    if (!b.due_date) return false;
+    const open = Number(b.total || 0) - Number(b.amount_paid || 0);
+    return open > 0.01 && b.due_date <= sevenISO;
+  });
+  const dueThisWeekTotal = dueThisWeek.reduce((s, b) => s + (Number(b.total) - Number(b.amount_paid || 0)), 0);
+
+  // -------- Active projects --------
+  const activeProjectCount = projects.length;
+  const activeProjectValue = projects.reduce((s, p) => s + Number(p.contract_amount || 0), 0);
+
+  // -------- Render --------
+  const area = document.getElementById('dash-area');
+  area.innerHTML = `
+    <!-- Row 1: Cash reality -->
+    <div class="summary-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:14px">
+      <div class="summary-cell" style="border-top:3px solid var(--green)">
+        <div class="muted">CASH ON HAND</div>
+        <div class="big" style="color:var(--ink-900)">${fmtMoney(cashOnHand)}</div>
+        <div class="muted" style="font-size:11px">across ${cashAccts.length} ${cashAccts.length === 1 ? 'account' : 'accounts'}</div>
+      </div>
+      <div class="summary-cell" style="border-top:3px solid ${creditDebt > 0 ? 'var(--red)' : 'var(--ink-300)'}">
+        <div class="muted">CREDIT DEBT</div>
+        <div class="big" style="color:${creditDebt > 0 ? 'var(--red)' : 'var(--ink-900)'}">${fmtMoney(creditDebt)}</div>
+        <div class="muted" style="font-size:11px">across ${creditAccts.length} ${creditAccts.length === 1 ? 'account' : 'accounts'}</div>
+      </div>
+      <div class="summary-cell" style="border-top:3px solid ${netPosition >= 0 ? 'var(--green)' : 'var(--red)'}">
+        <div class="muted">NET POSITION</div>
+        <div class="big" style="color:${netPosition >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtMoney(netPosition)}</div>
+        <div class="muted" style="font-size:11px">cash − credit debt</div>
       </div>
     </div>
 
-    <div class="card-grid">
-      ${statCard('ar', 'Total AR',           'accent-gold')}
-      ${statCard('ar30', 'AR > 30 Days',     'accent-red')}
-      ${statCard('ap', 'Total AP',           'accent-gold')}
-      ${statCard('ap7', 'AP Due This Week',  'accent-red')}
-      ${statCard('cash', 'Cash Position',    'accent-green')}
-      ${statCard('ten99', '1099 Vendors YTD')}
+    <!-- Row 2: Period selector + YTD cash flow -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-header" style="padding:10px 16px;border-bottom:1px solid var(--hairline)">
+        <div class="section-title">CASH FLOW PERIOD</div>
+        <div class="period-toggle" style="display:flex;gap:6px">
+          <button class="btn-sm ${period === 'ytd' ? 'btn-primary' : 'btn-ghost'}" id="per-ytd">Calendar YTD</button>
+          <button class="btn-sm ${period === '12m' ? 'btn-primary' : 'btn-ghost'}" id="per-12m">Last 12 Months</button>
+        </div>
+      </div>
+      <div class="summary-grid" style="grid-template-columns:repeat(3,1fr);padding:0;border:0">
+        <div class="summary-cell" style="border-top:0;border-right:1px solid var(--hairline)">
+          <div class="muted">MONEY IN · ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="big" style="color:var(--green)">${fmtMoney(moneyIn)}</div>
+          <div class="muted" style="font-size:11px">deposits to bank account${cashAccts.length > 1 ? 's' : ''}</div>
+        </div>
+        <div class="summary-cell" style="border-top:0;border-right:1px solid var(--hairline)">
+          <div class="muted">MONEY OUT · ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="big" style="color:var(--red)">${fmtMoney(totalCosts)}</div>
+          <div class="muted" style="font-size:11px">withdrawals ${fmtMoney(moneyOut)} + unpaid credit ${fmtMoney(creditDebt)}</div>
+        </div>
+        <div class="summary-cell" style="border-top:0">
+          <div class="muted">NET CASH FLOW</div>
+          <div class="big" style="color:${netCashFlow >= 0 ? 'var(--green)' : 'var(--red)'}">${netCashFlow >= 0 ? '+' : ''}${fmtMoney(netCashFlow)}</div>
+          <div class="muted" style="font-size:11px">in − out (true profit ${netCashFlow >= 0 ? '✓' : '✗'})</div>
+        </div>
+      </div>
     </div>
 
-    <div class="card-grid">
-      <div class="cashflow-card">
-        <div class="cashflow-head">
-          <h3>CASH FLOW · LAST 90 DAYS</h3>
-          <div class="stat-meta" id="cf-summary">&nbsp;</div>
+    <!-- Row 3: AR / AP / Due this week -->
+    <div class="summary-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:14px">
+      <div class="summary-cell" style="border-top:3px solid var(--gold)">
+        <div class="muted">OPEN AR</div>
+        <div class="big">${fmtMoney(arAging.total)}</div>
+        <div style="margin-top:8px">${agingBar(arAging)}</div>
+        <div class="muted" style="font-size:11px;margin-top:4px">${arAging.count} open invoice${arAging.count === 1 ? '' : 's'}</div>
+      </div>
+      <div class="summary-cell" style="border-top:3px solid var(--gold)">
+        <div class="muted">OPEN AP</div>
+        <div class="big">${fmtMoney(apAging.total)}</div>
+        <div style="margin-top:8px">${agingBar(apAging)}</div>
+        <div class="muted" style="font-size:11px;margin-top:4px">${apAging.count} open bill${apAging.count === 1 ? '' : 's'}</div>
+      </div>
+      <div class="summary-cell" style="border-top:3px solid ${dueThisWeek.length > 0 ? 'var(--red)' : 'var(--ink-300)'}">
+        <div class="muted">DUE THIS WEEK</div>
+        <div class="big" style="color:${dueThisWeek.length > 0 ? 'var(--red)' : 'var(--ink-900)'}">${fmtMoney(dueThisWeekTotal)}</div>
+        <div class="muted" style="font-size:11px">${dueThisWeek.length === 0 ? 'Nothing due in next 7 days' : `${dueThisWeek.length} bill${dueThisWeek.length === 1 ? '' : 's'} due in next 7 days`}</div>
+      </div>
+    </div>
+
+    <!-- Row 4: Cash flow chart + spending chart -->
+    <div style="display:grid;grid-template-columns:3fr 2fr;gap:14px;margin-bottom:14px">
+      <div class="card">
+        <div class="card-header">
+          <div class="section-title">CASH & DEBT · ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="muted" style="font-size:11px">Live balances over time</div>
         </div>
-        <svg id="cf-chart" class="cashflow-chart" viewBox="0 0 800 120" preserveAspectRatio="none"></svg>
+        <div id="cashflow-chart"></div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="section-title">TOP SPENDING · ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="muted" style="font-size:11px">Credit card categories</div>
+        </div>
+        <div id="spending-chart"></div>
+      </div>
+    </div>
+
+    <!-- Row 5: Active projects -->
+    <div class="summary-grid" style="grid-template-columns:1fr;margin-bottom:14px">
+      <div class="summary-cell" style="border-top:3px solid var(--ink-700)">
+        <div style="display:flex;align-items:center;gap:24px">
+          <div>
+            <div class="muted">ACTIVE PROJECTS</div>
+            <div class="big">${activeProjectCount}</div>
+          </div>
+          <div style="border-left:1px solid var(--hairline);padding-left:24px">
+            <div class="muted">TOTAL CONTRACT VALUE</div>
+            <div class="big">${fmtMoney(activeProjectValue)}</div>
+          </div>
+          <div class="muted" style="font-size:11px;margin-left:auto;max-width:300px;text-align:right">
+            Detailed project margins are tracked in the Takeoff app where labor + materials + equipment are reflected accurately.
+          </div>
+        </div>
       </div>
     </div>
   `;
 
-  // Fire all queries in parallel
-  const tasks = [
-    loadAR(),
-    loadAR30(),
-    loadAP(),
-    loadAP7(),
-    loadCash(),
-    load1099(),
-    loadCashFlow(),
+  // Wire up period toggle
+  document.getElementById('per-ytd').onclick = () => { setPeriod('ytd'); paint(); };
+  document.getElementById('per-12m').onclick = () => { setPeriod('12m'); paint(); };
+
+  // Draw charts
+  drawCashFlowChart(periodTxs, range, cashAcctIds, creditAcctIds);
+  drawSpendingChart(periodTxs, cats, creditAcctIds);
+}
+
+// Render the AR/AP aging mini-bar showing buckets as colored segments
+function agingBar(b) {
+  if (b.total <= 0) return '<div class="muted" style="font-size:11px">No open balances</div>';
+  const segs = [
+    { key: 'current', val: b.current, color: 'var(--green)', label: 'Current' },
+    { key: 'b30',     val: b.b30,     color: '#FBBF24',      label: '1-30' },
+    { key: 'b60',     val: b.b60,     color: '#F97316',      label: '31-60' },
+    { key: 'b90',     val: b.b90,     color: '#EF4444',      label: '61-90' },
+    { key: 'b90plus', val: b.b90plus, color: '#991B1B',      label: '90+' },
   ];
-  await Promise.all(tasks);
+  const bar = `<div style="display:flex;height:8px;border-radius:3px;overflow:hidden;background:var(--ink-50)">
+    ${segs.map(s => s.val > 0
+      ? `<div style="background:${s.color};width:${(s.val / b.total * 100).toFixed(2)}%" title="${s.label}: ${fmtMoney(s.val)}"></div>`
+      : '').join('')}
+  </div>`;
+  const labels = `<div style="display:flex;justify-content:space-between;gap:4px;margin-top:4px;font-size:10px;color:var(--ink-500)">
+    ${segs.filter(s => s.val > 0).map(s => `<span><span style="color:${s.color}">●</span> ${s.label}: ${fmtMoney(s.val)}</span>`).join('')}
+  </div>`;
+  return bar + labels;
 }
 
-// ------- Card helpers -------
-
-function statCard(id, label, accent = '') {
-  return `
-    <div class="stat-card ${accent}">
-      <div class="stat-label">${label}</div>
-      <div class="stat-value" id="card-${id}-value">—</div>
-      <div class="stat-meta" id="card-${id}-meta">&nbsp;</div>
-    </div>`;
-}
-
-function setCard(id, value, meta) {
-  const v = document.getElementById(`card-${id}-value`);
-  const m = document.getElementById(`card-${id}-meta`);
-  if (v) v.textContent = value;
-  if (m) m.innerHTML = meta || '&nbsp;';
-}
-
-function todayLabel() {
-  return new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-}
-
-// ------- Queries -------
-
-async function loadAR() {
-  // Sum of (total - amount_paid) across non-void invoices.
-  const { data, error } = await supabase
-    .from('invoices')
-    .select('total, amount_paid, status')
-    .neq('status', 'void')
-    .neq('status', 'draft');  // draft invoices aren't "AR" yet
-  if (error) return setCard('ar', 'ERR', error.message);
-  const open = (data || []).reduce((s, r) => s + (Number(r.total) - Number(r.amount_paid)), 0);
-  const count = (data || []).filter(r => Number(r.total) > Number(r.amount_paid)).length;
-  setCard('ar', fmtMoney(open), `${count} open invoice${count === 1 ? '' : 's'}`);
-}
-
-async function loadAR30() {
-  // Invoices with due_date >= 31 days past, outstanding balance.
-  const cutoff = daysAgoISO(31);
-  const { data, error } = await supabase
-    .from('invoices')
-    .select('total, amount_paid, due_date, status')
-    .neq('status', 'void')
-    .neq('status', 'draft')
-    .lte('due_date', cutoff);
-  if (error) return setCard('ar30', 'ERR', error.message);
-  const past = (data || []).reduce((s, r) => s + (Number(r.total) - Number(r.amount_paid)), 0);
-  const count = (data || []).filter(r => Number(r.total) > Number(r.amount_paid)).length;
-  setCard('ar30', fmtMoney(past), count > 0 ? `<span class="delta-down">${count} past due</span>` : 'All current');
-}
-
-async function loadAP() {
-  const { data, error } = await supabase
-    .from('bills')
-    .select('total, amount_paid, status')
-    .neq('status', 'void');
-  if (error) return setCard('ap', 'ERR', error.message);
-  const open = (data || []).reduce((s, r) => s + (Number(r.total) - Number(r.amount_paid)), 0);
-  const count = (data || []).filter(r => Number(r.total) > Number(r.amount_paid)).length;
-  setCard('ap', fmtMoney(open), `${count} open bill${count === 1 ? '' : 's'}`);
-}
-
-async function loadAP7() {
-  // Bills due within 7 days.
-  const todayISO = new Date().toISOString().slice(0, 10);
-  const weekISO = daysAheadISO(7);
-  const { data, error } = await supabase
-    .from('bills')
-    .select('total, amount_paid, due_date, status')
-    .neq('status', 'void')
-    .gte('due_date', todayISO)
-    .lte('due_date', weekISO);
-  if (error) return setCard('ap7', 'ERR', error.message);
-  const due = (data || []).reduce((s, r) => s + (Number(r.total) - Number(r.amount_paid)), 0);
-  const count = (data || []).length;
-  setCard('ap7', fmtMoney(due), count > 0 ? `${count} bill${count === 1 ? '' : 's'} due` : 'Nothing due');
-}
-
-async function loadCash() {
-  // Sum across active checking/savings accounts only.
-  // Credit cards and lines of credit are liabilities — not part of "cash on hand."
-  const { data, error } = await supabase
-    .from('bank_accounts')
-    .select('current_balance, account_type, is_active, name')
-    .eq('is_active', true)
-    .in('account_type', ['checking', 'savings']);
-  if (error) return setCard('cash', 'ERR', error.message);
-  const total = (data || []).reduce((s, r) => s + Number(r.current_balance), 0);
-  const count = (data || []).length;
-  setCard('cash', fmtMoney(total), count === 0 ? 'No bank accounts' : `Across ${count} account${count === 1 ? '' : 's'}`);
-}
-
-async function load1099() {
-  const year = new Date().getFullYear();
-  // Aggregate per vendor from v_1099_vendor_year
-  const { data, error } = await supabase
-    .from('v_1099_vendor_year')
-    .select('vendor_id, total_paid')
-    .eq('tax_year', year);
-  if (error) return setCard('ten99', 'ERR', error.message);
-
-  // Sum per vendor (across payment methods), count those >= $600
-  const byVendor = new Map();
-  (data || []).forEach(r => {
-    byVendor.set(r.vendor_id, (byVendor.get(r.vendor_id) || 0) + Number(r.total_paid));
-  });
-  const qualifying = [...byVendor.values()].filter(t => t >= 600).length;
-  const totalVendors = byVendor.size;
-  setCard('ten99', String(qualifying), `of ${totalVendors} 1099 vendor${totalVendors === 1 ? '' : 's'} · ${year}`);
-}
-
-async function loadCashFlow() {
-  // Daily net payment flow over the last 90 days.
-  const startISO = daysAgoISO(90);
-  const { data, error } = await supabase
-    .from('payments')
-    .select('date, amount, direction')
-    .gte('date', startISO)
-    .order('date');
-  if (error) {
-    drawSparklineError(error.message);
+// Cash & debt running balance chart
+function drawCashFlowChart(periodTxs, range, cashAcctIds, creditAcctIds) {
+  const wrap = document.getElementById('cashflow-chart');
+  // Build daily series for each side
+  // Cash series: sum of latest balance_after per cash account, per day
+  // Debt series: sum of latest balance_after per credit account, per day
+  // For days without a tx for an account, carry forward the previous balance.
+  const allDates = new Set();
+  for (const t of periodTxs) allDates.add(t.date);
+  if (!allDates.size) {
+    wrap.innerHTML = '<div class="empty-state"><div class="muted">No transactions in this period.</div></div>';
     return;
   }
+  const sortedDates = [...allDates].sort();
 
-  // Bucket by date
-  const buckets = new Map();
-  for (let i = 0; i <= 90; i++) {
-    buckets.set(daysAgoISO(90 - i), 0);
+  // Per-account latest-known balance (we'll iterate dates and update)
+  function buildSeries(acctIds) {
+    const perAcctLatest = new Map(); // acctId -> last known balance
+    const seriesMap = new Map();     // date -> total
+    // Pre-seed with the earliest known balance for each account before the period start
+    const earlierTxs = (window.__dashData.txs || []).filter(t => t.date < range.start);
+    for (const t of earlierTxs) {
+      if (!acctIds.has(t.bank_account_id) || t.balance_after == null) continue;
+      // Take latest before period
+      const cur = perAcctLatest.get(t.bank_account_id);
+      const curDate = cur?.date || '';
+      if (t.date >= curDate) perAcctLatest.set(t.bank_account_id, { date: t.date, bal: Number(t.balance_after) });
+    }
+    // Initial total before period start
+    function totalNow() {
+      let s = 0;
+      for (const v of perAcctLatest.values()) s += (typeof v === 'number' ? v : v.bal || 0);
+      return s;
+    }
+    // Convert to flat numbers for simpler ongoing updates
+    for (const [k, v] of perAcctLatest) {
+      perAcctLatest.set(k, typeof v === 'number' ? v : v.bal || 0);
+    }
+    // Walk dates in period in order
+    for (const d of sortedDates) {
+      const dayTxs = periodTxs.filter(t => t.date === d && acctIds.has(t.bank_account_id) && t.balance_after != null);
+      // For each account that appears, update latest to that day's last balance_after
+      const byAcct = new Map();
+      for (const t of dayTxs) {
+        const cur = byAcct.get(t.bank_account_id);
+        if (!cur || (t.created_at || '').localeCompare(cur.created_at || '') > 0) {
+          byAcct.set(t.bank_account_id, t);
+        }
+      }
+      for (const [acctId, t] of byAcct) {
+        perAcctLatest.set(acctId, Number(t.balance_after));
+      }
+      seriesMap.set(d, totalNow());
+    }
+    return seriesMap;
   }
-  (data || []).forEach(p => {
-    const signed = p.direction === 'received' ? Number(p.amount) : -Number(p.amount);
-    if (buckets.has(p.date)) buckets.set(p.date, buckets.get(p.date) + signed);
-  });
+  const cashSeries = buildSeries(cashAcctIds);
+  const debtSeries = buildSeries(creditAcctIds);
 
-  const series = [...buckets.entries()].map(([date, val]) => ({ date, val }));
-  drawSparkline(series);
+  const dates = sortedDates;
+  const cashVals = dates.map(d => cashSeries.get(d) ?? 0);
+  const debtVals = dates.map(d => debtSeries.get(d) ?? 0);
 
-  const totalIn = (data || []).filter(p => p.direction === 'received').reduce((s, p) => s + Number(p.amount), 0);
-  const totalOut = (data || []).filter(p => p.direction === 'sent').reduce((s, p) => s + Number(p.amount), 0);
-  const net = totalIn - totalOut;
-  const summary = document.getElementById('cf-summary');
-  if (summary) {
-    summary.innerHTML = `
-      In ${fmtMoney(totalIn)} · Out ${fmtMoney(totalOut)} ·
-      Net <span class="${net >= 0 ? 'delta-up' : 'delta-down'}">${fmtMoney(net)}</span>`;
+  // SVG sizing
+  const W = 900, H = 240, M = { l: 60, r: 20, t: 10, b: 30 };
+  const innerW = W - M.l - M.r;
+  const innerH = H - M.t - M.b;
+  const allVals = [...cashVals, ...debtVals];
+  const minV = Math.min(0, ...allVals);
+  const maxV = Math.max(...allVals);
+  const padV = (maxV - minV) * 0.1 || 100;
+  const yMin = minV - padV;
+  const yMax = maxV + padV;
+  const rng = (yMax - yMin) || 1;
+  const x = i => M.l + (innerW * i / Math.max(1, dates.length - 1));
+  const y = v => M.t + innerH * (1 - (v - yMin) / rng);
+
+  function pathFor(vals) {
+    return vals.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
   }
-}
+  const cashPath = pathFor(cashVals);
+  const debtPath = pathFor(debtVals);
 
-// ------- Sparkline drawing -------
-
-function drawSparkline(series) {
-  const svg = document.getElementById('cf-chart');
-  if (!svg) return;
-  svg.innerHTML = '';
-
-  const W = 800, H = 120;
-  const padX = 10, padY = 10;
-  const plotW = W - padX * 2;
-  const plotH = H - padY * 2;
-
-  // Compute cumulative balance (running sum of daily nets), which is the
-  // more meaningful line than raw daily net — gives the shape of cash position
-  // drift over the window.
-  let cum = 0;
-  const pts = series.map((p, i) => {
-    cum += p.val;
-    return { x: i, y: cum, date: p.date };
+  const yTicks = 4;
+  const yLabels = Array.from({ length: yTicks + 1 }, (_, i) => {
+    const v = yMin + (rng * i / yTicks);
+    return { v, ypx: y(v) };
   });
+  const xTickIdxs = dates.length <= 5
+    ? dates.map((_, i) => i)
+    : [0, Math.floor(dates.length * 0.25), Math.floor(dates.length * 0.5), Math.floor(dates.length * 0.75), dates.length - 1];
 
-  const ys = pts.map(p => p.y);
-  const yMin = Math.min(...ys, 0);
-  const yMax = Math.max(...ys, 0);
-  const yRange = (yMax - yMin) || 1;
+  function shortDate(iso) {
+    const d = new Date(iso + 'T00:00:00');
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
 
-  const x = (i) => padX + (i / (pts.length - 1)) * plotW;
-  const y = (val) => padY + plotH - ((val - yMin) / yRange) * plotH;
-
-  // Zero line
-  const zeroY = y(0);
-  const zeroLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-  zeroLine.setAttribute('x1', padX);
-  zeroLine.setAttribute('x2', W - padX);
-  zeroLine.setAttribute('y1', zeroY);
-  zeroLine.setAttribute('y2', zeroY);
-  zeroLine.setAttribute('stroke', 'var(--ink-200)');
-  zeroLine.setAttribute('stroke-dasharray', '3 3');
-  svg.appendChild(zeroLine);
-
-  // Area fill
-  const area = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  const areaPath = `M ${x(0)} ${zeroY} ` +
-    pts.map(p => `L ${x(p.x)} ${y(p.y)}`).join(' ') +
-    ` L ${x(pts.length - 1)} ${zeroY} Z`;
-  area.setAttribute('d', areaPath);
-  area.setAttribute('fill', 'var(--sky)');
-  area.setAttribute('opacity', '0.15');
-  svg.appendChild(area);
-
-  // Line
-  const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${x(p.x)} ${y(p.y)}`).join(' ');
-  line.setAttribute('d', linePath);
-  line.setAttribute('fill', 'none');
-  line.setAttribute('stroke', 'var(--sky)');
-  line.setAttribute('stroke-width', '2');
-  line.setAttribute('stroke-linejoin', 'round');
-  svg.appendChild(line);
-
-  // End dot
-  const last = pts[pts.length - 1];
-  const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-  dot.setAttribute('cx', x(last.x));
-  dot.setAttribute('cy', y(last.y));
-  dot.setAttribute('r', '4');
-  dot.setAttribute('fill', 'var(--gold)');
-  dot.setAttribute('stroke', 'white');
-  dot.setAttribute('stroke-width', '2');
-  svg.appendChild(dot);
-
-  // Start/end date labels (small)
-  const startLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-  startLabel.setAttribute('x', padX);
-  startLabel.setAttribute('y', H - 2);
-  startLabel.setAttribute('font-size', '10');
-  startLabel.setAttribute('fill', 'var(--ink-400)');
-  startLabel.setAttribute('font-family', 'JetBrains Mono, monospace');
-  startLabel.textContent = fmtDateShort(pts[0].date);
-  svg.appendChild(startLabel);
-
-  const endLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-  endLabel.setAttribute('x', W - padX);
-  endLabel.setAttribute('y', H - 2);
-  endLabel.setAttribute('text-anchor', 'end');
-  endLabel.setAttribute('font-size', '10');
-  endLabel.setAttribute('fill', 'var(--ink-400)');
-  endLabel.setAttribute('font-family', 'JetBrains Mono, monospace');
-  endLabel.textContent = fmtDateShort(last.date);
-  svg.appendChild(endLabel);
+  wrap.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;font-family:inherit">
+      ${yLabels.map(t => `<line x1="${M.l}" y1="${t.ypx}" x2="${M.l + innerW}" y2="${t.ypx}" stroke="var(--hairline)" stroke-width="1"/>`).join('')}
+      ${cashVals.length ? `<path d="${cashPath}" fill="none" stroke="#3B82F6" stroke-width="2"/>` : ''}
+      ${debtVals.length ? `<path d="${debtPath}" fill="none" stroke="#EF4444" stroke-width="2"/>` : ''}
+      ${yLabels.map(t => `<text x="${M.l - 8}" y="${t.ypx + 4}" text-anchor="end" font-size="10" fill="var(--ink-500)">$${Math.round(t.v).toLocaleString()}</text>`).join('')}
+      ${xTickIdxs.map(i => `<text x="${x(i).toFixed(1)}" y="${H - 10}" text-anchor="middle" font-size="10" fill="var(--ink-500)">${shortDate(dates[i])}</text>`).join('')}
+      <g transform="translate(${M.l + 10}, ${M.t + 12})">
+        <rect width="10" height="10" fill="#3B82F6"/>
+        <text x="14" y="9" font-size="10" fill="var(--ink-700)">Cash on hand</text>
+        <rect x="100" width="10" height="10" fill="#EF4444"/>
+        <text x="114" y="9" font-size="10" fill="var(--ink-700)">Credit debt</text>
+      </g>
+    </svg>
+  `;
 }
 
-function drawSparklineError(msg) {
-  const svg = document.getElementById('cf-chart');
-  if (!svg) return;
-  svg.innerHTML = `<text x="400" y="60" text-anchor="middle" fill="var(--ink-400)" font-size="12">${msg}</text>`;
-}
+// Top spending chart from credit card transactions in the period
+function drawSpendingChart(periodTxs, cats, creditAcctIds) {
+  const wrap = document.getElementById('spending-chart');
+  if (!cats || !cats.length) {
+    wrap.innerHTML = '<div class="empty-state"><div class="muted">No categories defined.</div></div>';
+    return;
+  }
+  // Filter to credit-card outflows (negative amounts)
+  const ccOutflows = periodTxs.filter(t =>
+    creditAcctIds.has(t.bank_account_id) && Number(t.amount) < 0
+  );
+  if (!ccOutflows.length) {
+    wrap.innerHTML = '<div class="empty-state"><div class="muted">No credit card spending in this period.</div></div>';
+    return;
+  }
+  const catMap = new Map(cats.map(c => [c.id, c]));
+  const byCat = new Map();
+  let uncatTotal = 0;
+  // Skip "Payments" — those are credit card payments received, not spending
+  const PAYMENTS_NAME = 'Payments';
+  for (const t of ccOutflows) {
+    const amt = Math.abs(Number(t.amount));
+    const c = catMap.get(t.category_id);
+    if (!c) { uncatTotal += amt; continue; }
+    if (c.name === PAYMENTS_NAME) continue;
+    byCat.set(c.id, (byCat.get(c.id) || 0) + amt);
+  }
+  const rows = [...byCat.entries()].map(([id, amt]) => {
+    const c = catMap.get(id);
+    return { name: c.name, color: c.color || '#888', amount: amt };
+  }).sort((a, b) => b.amount - a.amount).slice(0, 6);
+  if (uncatTotal > 0 && rows.length < 7) {
+    rows.push({ name: 'Uncategorized', color: '#CCCCCC', amount: uncatTotal });
+  }
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty-state"><div class="muted">No categorized spending in this period.</div></div>';
+    return;
+  }
+  const totalSpend = rows.reduce((s, r) => s + r.amount, 0);
+  const maxAmt = Math.max(...rows.map(r => r.amount));
 
-// ------- Date helpers -------
-
-function daysAgoISO(days) {
-  const d = new Date();
-  d.setDate(d.getDate() - days);
-  return d.toISOString().slice(0, 10);
-}
-function daysAheadISO(days) {
-  const d = new Date();
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  wrap.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:6px;padding:8px 0">
+      <div class="muted" style="font-size:11px;margin-bottom:4px">Total: <strong>${fmtMoney(totalSpend)}</strong> (top ${rows.length})</div>
+      ${rows.map(r => {
+        const pct = totalSpend > 0 ? (r.amount / totalSpend * 100) : 0;
+        const widthPct = maxAmt > 0 ? (r.amount / maxAmt * 100) : 0;
+        return `
+          <div style="display:grid;grid-template-columns:120px 1fr 80px;gap:6px;align-items:center;font-size:12px">
+            <div style="display:flex;align-items:center;gap:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span style="display:inline-block;width:8px;height:8px;background:${r.color};border-radius:2px;flex-shrink:0"></span><span style="overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.name)}</span></div>
+            <div style="background:var(--ink-50);height:14px;border-radius:3px;overflow:hidden">
+              <div style="background:${r.color};height:100%;width:${widthPct.toFixed(1)}%;opacity:0.85"></div>
+            </div>
+            <div class="numeric mono" style="font-weight:600;font-size:11px">${fmtMoney(r.amount)}</div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
 }
