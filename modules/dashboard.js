@@ -1,15 +1,11 @@
 // =============================================================================
-// Dashboard &#226;&#128;&#148; cash reality, YTD profit/loss, AR/AP aging, charts
+// Dashboard - cash reality, YTD profit/loss, AR/AP aging, charts
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
 
-function getPeriod() {
-  return window.__dashPeriod || 'ytd';
-}
-function setPeriod(p) {
-  window.__dashPeriod = p;
-}
+function getPeriod() { return window.__dashPeriod || 'ytd'; }
+function setPeriod(p) { window.__dashPeriod = p; }
 
 function periodRange(p) {
   const today = new Date();
@@ -54,7 +50,6 @@ async function loadAndRender() {
     area.innerHTML = `<div class="empty-state"><div class="big" style="color:var(--red)">ERROR</div><div>${escapeHtml(e.message)}</div></div>`;
   }
 }
-
 function paint() {
   const { accts, txs, invoices, bills, cats, projects } = window.__dashData;
   const period = getPeriod();
@@ -67,9 +62,7 @@ function paint() {
 
   function latestBalance(acctId) {
     const list = txs.filter(t => t.bank_account_id === acctId);
-    const sorted = [...list].sort((a, b) =>
-      b.date.localeCompare(a.date) || (b.created_at || '').localeCompare(a.created_at || '')
-    );
+    const sorted = [...list].sort((a, b) => b.date.localeCompare(a.date) || (b.created_at || '').localeCompare(a.created_at || ''));
     const withBal = sorted.find(t => t.balance_after != null);
     return withBal ? Number(withBal.balance_after) : Number(accts.find(a => a.id === acctId)?.current_balance || 0);
   }
@@ -97,9 +90,8 @@ function paint() {
       if (open <= 0.01) continue;
       buckets.total += open;
       buckets.count++;
-      if (!r.due_date || r.due_date >= today) {
-        buckets.current += open;
-      } else {
+      if (!r.due_date || r.due_date >= today) { buckets.current += open; }
+      else {
         const days = Math.floor((new Date(today) - new Date(r.due_date)) / 86400000);
         if (days <= 30) buckets.b30 += open;
         else if (days <= 60) buckets.b60 += open;
@@ -124,33 +116,6 @@ function paint() {
 
   const activeProjectCount = projects.length;
   const activeProjectValue = projects.reduce((s, p) => s + Number(p.contract_amount || 0), 0);
-    // ===== brief_snapshot push &#8212; feeds the morning brief =====
-    // Fire-and-forget upsert; doesn't block render if it fails.
-    try {
-      supabase.from('brief_snapshot').upsert({
-        id: 'current',
-        open_ar: arAging.total,
-        open_ar_count: arAging.count,
-        ar_current: arAging.current,
-        ar_1_30: arAging.b30,
-        ar_31_60: arAging.b60,
-        ar_61_90: arAging.b90,
-        ar_90_plus: arAging.b90plus,
-        ar_over_30: arAging.b30 + arAging.b60 + arAging.b90 + arAging.b90plus,
-        open_ap: apAging.total,
-        due_this_week: dueThisWeekTotal,
-        cash_on_hand: cashOnHand,
-        credit_debt: creditDebt,
-        net_position: netPosition,
-        active_contract_value: activeProjectValue,
-        active_count: activeProjectCount,
-        updated_at: new Date().toISOString(),
-      }).then(({ error }) => {
-        if (error) console.warn('brief_snapshot push failed:', error.message);
-      }).catch(err => console.warn('brief_snapshot push error:', err));
-    } catch (e) { /* never block dashboard render */ }
-    // ===== end brief_snapshot push =====
-
 
   const area = document.getElementById('dash-area');
   area.innerHTML = `
@@ -168,7 +133,7 @@ function paint() {
       <div class="summary-cell" style="border-top:3px solid ${netPosition >= 0 ? 'var(--green)' : 'var(--red)'}">
         <div class="muted">NET POSITION</div>
         <div class="big" style="color:${netPosition >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtMoney(netPosition)}</div>
-        <div class="muted" style="font-size:11px">cash &#226;&#136;&#146; credit debt</div>
+        <div class="muted" style="font-size:11px">cash &#8722; credit debt</div>
       </div>
     </div>
 
@@ -182,19 +147,19 @@ function paint() {
       </div>
       <div class="summary-grid" style="grid-template-columns:repeat(3,1fr);padding:0;border:0">
         <div class="summary-cell" style="border-top:0;border-right:1px solid var(--hairline)">
-          <div class="muted">MONEY IN &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="muted">MONEY IN &#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="big" style="color:var(--green)">${fmtMoney(moneyIn)}</div>
           <div class="muted" style="font-size:11px">deposits to bank account${cashAccts.length > 1 ? 's' : ''}</div>
         </div>
         <div class="summary-cell" style="border-top:0;border-right:1px solid var(--hairline)">
-          <div class="muted">MONEY OUT &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="muted">MONEY OUT &#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="big" style="color:var(--red)">${fmtMoney(totalCosts)}</div>
           <div class="muted" style="font-size:11px">withdrawals ${fmtMoney(moneyOut)} + unpaid credit ${fmtMoney(creditDebt)}</div>
         </div>
         <div class="summary-cell" style="border-top:0">
           <div class="muted">NET CASH FLOW</div>
           <div class="big" style="color:${netCashFlow >= 0 ? 'var(--green)' : 'var(--red)'}">${netCashFlow >= 0 ? '+' : ''}${fmtMoney(netCashFlow)}</div>
-          <div class="muted" style="font-size:11px">in &#226;&#136;&#146; out (true profit ${netCashFlow >= 0 ? '&#226;&#156;&#147;' : '&#226;&#156;&#151;'})</div>
+          <div class="muted" style="font-size:11px">in &#8722; out (true profit ${netCashFlow >= 0 ? '&#10003;' : '&#10007;'})</div>
         </div>
       </div>
     </div>
@@ -222,14 +187,14 @@ function paint() {
     <div style="display:grid;grid-template-columns:3fr 2fr;gap:14px;margin-bottom:14px">
       <div class="card">
         <div class="card-header">
-          <div class="section-title">CASH & DEBT &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="section-title">CASH &amp; DEBT &#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="muted" style="font-size:11px">Live balances over time</div>
         </div>
         <div id="cashflow-chart"></div>
       </div>
       <div class="card">
         <div class="card-header">
-          <div class="section-title">TOP SPENDING &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="section-title">TOP SPENDING &#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="muted" style="font-size:11px">Credit card categories</div>
         </div>
         <div id="spending-chart"></div>
@@ -265,19 +230,17 @@ function paint() {
 function agingBar(b) {
   if (b.total <= 0) return '<div class="muted" style="font-size:11px">No open balances</div>';
   const segs = [
-    { key: 'current', val: b.current, color: 'var(--green)', label: 'Current' },
-    { key: 'b30',     val: b.b30,     color: '#FBBF24',      label: '1-30' },
-    { key: 'b60',     val: b.b60,     color: '#F97316',      label: '31-60' },
-    { key: 'b90',     val: b.b90,     color: '#EF4444',      label: '61-90' },
-    { key: 'b90plus', val: b.b90plus, color: '#991B1B',      label: '90+' },
+    { val: b.current, color: 'var(--green)', label: 'Current' },
+    { val: b.b30,     color: '#FBBF24',      label: '1-30' },
+    { val: b.b60,     color: '#F97316',      label: '31-60' },
+    { val: b.b90,     color: '#EF4444',      label: '61-90' },
+    { val: b.b90plus, color: '#991B1B',      label: '90+' },
   ];
   const bar = `<div style="display:flex;height:8px;border-radius:3px;overflow:hidden;background:var(--ink-50)">
-    ${segs.map(s => s.val > 0
-      ? `<div style="background:${s.color};width:${(s.val / b.total * 100).toFixed(2)}%" title="${s.label}: ${fmtMoney(s.val)}"></div>`
-      : '').join('')}
+    ${segs.map(s => s.val > 0 ? `<div style="background:${s.color};width:${(s.val / b.total * 100).toFixed(2)}%" title="${s.label}: ${fmtMoney(s.val)}"></div>` : '').join('')}
   </div>`;
   const labels = `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;font-size:10px;color:var(--ink-500)">
-    ${segs.filter(s => s.val > 0).map(s => `<span><span style="color:${s.color}">&#226;&#151;&#143;</span> ${s.label}: ${fmtMoney(s.val)}</span>`).join('')}
+    ${segs.filter(s => s.val > 0).map(s => `<span><span style="color:${s.color}">&#9679;</span> ${s.label}: ${fmtMoney(s.val)}</span>`).join('')}
   </div>`;
   return bar + labels;
 }
@@ -301,11 +264,7 @@ function drawCashFlowChart(periodTxs, range, cashAcctIds, creditAcctIds) {
       if (!cur || t.date >= cur.date) perAcctLatest.set(t.bank_account_id, { date: t.date, bal: Number(t.balance_after) });
     }
     for (const [k, v] of perAcctLatest) perAcctLatest.set(k, v.bal || 0);
-    function totalNow() {
-      let s = 0;
-      for (const v of perAcctLatest.values()) s += v;
-      return s;
-    }
+    function totalNow() { let s = 0; for (const v of perAcctLatest.values()) s += v; return s; }
     for (const d of sortedDates) {
       const dayTxs = periodTxs.filter(t => t.date === d && acctIds.has(t.bank_account_id) && t.balance_after != null);
       const byAcct = new Map();
@@ -341,18 +300,10 @@ function drawCashFlowChart(periodTxs, range, cashAcctIds, creditAcctIds) {
   const debtPath = debtVals.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
 
   const yTicks = 4;
-  const yLabels = Array.from({ length: yTicks + 1 }, (_, i) => {
-    const v = yMin + (rng * i / yTicks);
-    return { v, ypx: y(v) };
-  });
-  const xTickIdxs = dates.length <= 5
-    ? dates.map((_, i) => i)
-    : [0, Math.floor(dates.length * 0.25), Math.floor(dates.length * 0.5), Math.floor(dates.length * 0.75), dates.length - 1];
+  const yLabels = Array.from({ length: yTicks + 1 }, (_, i) => { const v = yMin + (rng * i / yTicks); return { v, ypx: y(v) }; });
+  const xTickIdxs = dates.length <= 5 ? dates.map((_, i) => i) : [0, Math.floor(dates.length * 0.25), Math.floor(dates.length * 0.5), Math.floor(dates.length * 0.75), dates.length - 1];
 
-  function shortDate(iso) {
-    const d = new Date(iso + 'T00:00:00');
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  }
+  function shortDate(iso) { const d = new Date(iso + 'T00:00:00'); return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); }
 
   wrap.innerHTML = `
     <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;font-family:inherit">
@@ -392,13 +343,8 @@ function drawSpendingChart(periodTxs, cats, creditAcctIds) {
     if (c.name === 'Payments') continue;
     byCat.set(c.id, (byCat.get(c.id) || 0) + amt);
   }
-  const rows = [...byCat.entries()].map(([id, amt]) => {
-    const c = catMap.get(id);
-    return { name: c.name, color: c.color || '#888', amount: amt };
-  }).sort((a, b) => b.amount - a.amount).slice(0, 6);
-  if (uncatTotal > 0 && rows.length < 7) {
-    rows.push({ name: 'Uncategorized', color: '#CCCCCC', amount: uncatTotal });
-  }
+  const rows = [...byCat.entries()].map(([id, amt]) => { const c = catMap.get(id); return { name: c.name, color: c.color || '#888', amount: amt }; }).sort((a, b) => b.amount - a.amount).slice(0, 6);
+  if (uncatTotal > 0 && rows.length < 7) rows.push({ name: 'Uncategorized', color: '#CCCCCC', amount: uncatTotal });
   if (!rows.length) {
     wrap.innerHTML = '<div class="empty-state"><div class="muted">No categorized spending in this period.</div></div>';
     return;
@@ -409,18 +355,13 @@ function drawSpendingChart(periodTxs, cats, creditAcctIds) {
   wrap.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:6px;padding:8px 0">
       <div class="muted" style="font-size:11px;margin-bottom:4px">Total: <strong>${fmtMoney(totalSpend)}</strong> (top ${rows.length})</div>
-      ${rows.map(r => {
-        const widthPct = maxAmt > 0 ? (r.amount / maxAmt * 100) : 0;
-        return `
-          <div style="display:grid;grid-template-columns:120px 1fr 80px;gap:6px;align-items:center;font-size:12px">
-            <div style="display:flex;align-items:center;gap:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span style="display:inline-block;width:8px;height:8px;background:${r.color};border-radius:2px;flex-shrink:0"></span><span style="overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.name)}</span></div>
-            <div style="background:var(--ink-50);height:14px;border-radius:3px;overflow:hidden">
-              <div style="background:${r.color};height:100%;width:${widthPct.toFixed(1)}%;opacity:0.85"></div>
-            </div>
-            <div class="numeric mono" style="font-weight:600;font-size:11px">${fmtMoney(r.amount)}</div>
-          </div>
-        `;
-      }).join('')}
+      ${rows.map(r => { const widthPct = maxAmt > 0 ? (r.amount / maxAmt * 100) : 0; return `
+        <div style="display:grid;grid-template-columns:120px 1fr 80px;gap:6px;align-items:center;font-size:12px">
+          <div style="display:flex;align-items:center;gap:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span style="display:inline-block;width:8px;height:8px;background:${r.color};border-radius:2px;flex-shrink:0"></span><span style="overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.name)}</span></div>
+          <div style="background:var(--ink-50);height:14px;border-radius:3px;overflow:hidden"><div style="background:${r.color};height:100%;width:${widthPct.toFixed(1)}%;opacity:0.85"></div></div>
+          <div class="numeric mono" style="font-weight:600;font-size:11px">${fmtMoney(r.amount)}</div>
+        </div>
+      `; }).join('')}
     </div>
   `;
 }
