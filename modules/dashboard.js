@@ -1,5 +1,5 @@
 // =============================================================================
-// Dashboard â cash reality, YTD profit/loss, AR/AP aging, charts
+// Dashboard &#226;&#128;&#148; cash reality, YTD profit/loss, AR/AP aging, charts
 // =============================================================================
 import { supabase, q } from '../lib/supabase.js';
 import { fmtMoney, fmtDate, escapeHtml } from '../lib/format.js';
@@ -124,7 +124,7 @@ function paint() {
 
   const activeProjectCount = projects.length;
   const activeProjectValue = projects.reduce((s, p) => s + Number(p.contract_amount || 0), 0);
-    // ===== brief_snapshot push — feeds the morning brief =====
+    // ===== brief_snapshot push &#8212; feeds the morning brief =====
     // Fire-and-forget upsert; doesn't block render if it fails.
     try {
       supabase.from('brief_snapshot').upsert({
@@ -168,7 +168,7 @@ function paint() {
       <div class="summary-cell" style="border-top:3px solid ${netPosition >= 0 ? 'var(--green)' : 'var(--red)'}">
         <div class="muted">NET POSITION</div>
         <div class="big" style="color:${netPosition >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtMoney(netPosition)}</div>
-        <div class="muted" style="font-size:11px">cash â credit debt</div>
+        <div class="muted" style="font-size:11px">cash &#226;&#136;&#146; credit debt</div>
       </div>
     </div>
 
@@ -182,19 +182,19 @@ function paint() {
       </div>
       <div class="summary-grid" style="grid-template-columns:repeat(3,1fr);padding:0;border:0">
         <div class="summary-cell" style="border-top:0;border-right:1px solid var(--hairline)">
-          <div class="muted">MONEY IN Â· ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="muted">MONEY IN &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="big" style="color:var(--green)">${fmtMoney(moneyIn)}</div>
           <div class="muted" style="font-size:11px">deposits to bank account${cashAccts.length > 1 ? 's' : ''}</div>
         </div>
         <div class="summary-cell" style="border-top:0;border-right:1px solid var(--hairline)">
-          <div class="muted">MONEY OUT Â· ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="muted">MONEY OUT &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="big" style="color:var(--red)">${fmtMoney(totalCosts)}</div>
           <div class="muted" style="font-size:11px">withdrawals ${fmtMoney(moneyOut)} + unpaid credit ${fmtMoney(creditDebt)}</div>
         </div>
         <div class="summary-cell" style="border-top:0">
           <div class="muted">NET CASH FLOW</div>
           <div class="big" style="color:${netCashFlow >= 0 ? 'var(--green)' : 'var(--red)'}">${netCashFlow >= 0 ? '+' : ''}${fmtMoney(netCashFlow)}</div>
-          <div class="muted" style="font-size:11px">in â out (true profit ${netCashFlow >= 0 ? 'â' : 'â'})</div>
+          <div class="muted" style="font-size:11px">in &#226;&#136;&#146; out (true profit ${netCashFlow >= 0 ? '&#226;&#156;&#147;' : '&#226;&#156;&#151;'})</div>
         </div>
       </div>
     </div>
@@ -222,14 +222,14 @@ function paint() {
     <div style="display:grid;grid-template-columns:3fr 2fr;gap:14px;margin-bottom:14px">
       <div class="card">
         <div class="card-header">
-          <div class="section-title">CASH & DEBT Â· ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="section-title">CASH & DEBT &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="muted" style="font-size:11px">Live balances over time</div>
         </div>
         <div id="cashflow-chart"></div>
       </div>
       <div class="card">
         <div class="card-header">
-          <div class="section-title">TOP SPENDING Â· ${escapeHtml(range.label).toUpperCase()}</div>
+          <div class="section-title">TOP SPENDING &#194;&#183; ${escapeHtml(range.label).toUpperCase()}</div>
           <div class="muted" style="font-size:11px">Credit card categories</div>
         </div>
         <div id="spending-chart"></div>
@@ -277,7 +277,7 @@ function agingBar(b) {
       : '').join('')}
   </div>`;
   const labels = `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;font-size:10px;color:var(--ink-500)">
-    ${segs.filter(s => s.val > 0).map(s => `<span><span style="color:${s.color}">â</span> ${s.label}: ${fmtMoney(s.val)}</span>`).join('')}
+    ${segs.filter(s => s.val > 0).map(s => `<span><span style="color:${s.color}">&#226;&#151;&#143;</span> ${s.label}: ${fmtMoney(s.val)}</span>`).join('')}
   </div>`;
   return bar + labels;
 }
